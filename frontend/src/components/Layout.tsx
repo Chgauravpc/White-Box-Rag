@@ -43,7 +43,7 @@ export default function Layout({ children }: { children: ReactNode }) {
             <path d="M11 11l3 3" />
           </svg>
           RAG Query
-          <span className="nav-badge">3</span>
+          {/* <span className="nav-badge">3</span> */}
         </Link>
 
         <div className="nav-section">Verification</div>
@@ -52,7 +52,7 @@ export default function Layout({ children }: { children: ReactNode }) {
             <path d="M14 4L6 12 2 8" />
           </svg>
           Trust Gating
-          <span className="nav-badge warn">1</span>
+          {/* <span className="nav-badge warn">1</span> */}
         </Link>
         <Link to="/brd" className={getLinkClass("/brd")}>
           <svg className="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
@@ -76,19 +76,19 @@ export default function Layout({ children }: { children: ReactNode }) {
             <circle cx="12" cy="11" r="3" />
           </svg>
           Audit Trail
-          <span className="nav-badge safe">12</span>
+          {/* <span className="nav-badge safe">12</span> */}
         </Link>
 
         <div className="sidebar-footer">
           <div className="status-row">
             <div className="pulse"></div>
-            Backend services online
+            {/* Backend services online */}
           </div>
           <div className="status-row" style={{ marginBottom: 0 }}>
             <svg width="6" height="6" viewBox="0 0 6 6">
               <circle cx="3" cy="3" r="3" fill="var(--accent2)" opacity=".6" />
             </svg>
-            Gemini Pro 3.0 connected
+            {/* Gemini Pro 3.0 connected */}
           </div>
         </div>
       </aside>
