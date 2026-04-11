@@ -46,7 +46,7 @@ async def verify_rag_response(request: RAGResponse):
         raise HTTPException(status_code=400, detail="No claims provided to verify.")
         
     # 1. Verify claims
-    verifications = await verify_all_claims(request.claims)
+    verifications, _, _ = await verify_all_claims(request.claims)
     
     # 2. Gate (Assuming no conflicts passed in this simple flow)
     conflicts = [] 

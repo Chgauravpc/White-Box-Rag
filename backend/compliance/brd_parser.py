@@ -109,10 +109,7 @@ Example:
 """
 
     # 3. Call Gemini (BP3 uses Gemini to structure)
-    try:
-        response_text = await call_gemini(prompt, temperature=0.1)
-    except Exception as e:
-        raise RuntimeError(f"Error calling Gemini Client: {e}")
+    response_text = await call_gemini(prompt, temperature=0.1)
 
     # Clean up markdown if Gemini includes it despite our instruction
     response_text = response_text.strip()

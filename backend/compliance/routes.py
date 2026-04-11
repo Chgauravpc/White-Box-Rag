@@ -109,12 +109,7 @@ async def get_sample_brd():
 @router.get("/audit/logs")
 async def list_audit_logs():
     try:
-        logs = get_all_logs()
-        return {
-            "status": "success",
-            "message": "Audit logs retrieved",
-            "data": logs
-        }
+        return get_all_logs()
     except Exception as e:
         logger.error(f"Error getting audit logs: {e}")
         return JSONResponse(status_code=500, content={"status": "error", "message": "Failed to retrieve audit logs"})
@@ -126,11 +121,7 @@ async def get_audit_report(id: int):
         if not report:
             return JSONResponse(status_code=404, content={"status": "error", "message": "Audit report not found."})
             
-        return {
-            "status": "success",
-            "message": "Report found",
-            "data": report
-        }
+        return report
     except Exception as e:
         logger.error(f"Error getting audit report {id}: {e}")
         return JSONResponse(status_code=500, content={"status": "error", "message": "Failed to retrieve audit report"})

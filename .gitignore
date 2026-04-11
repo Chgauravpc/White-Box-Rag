@@ -50,8 +50,11 @@ backend/test_*.py
 **/test_*.py
 htmlcov/
 .coverage
-coverage.xml
-
-
-backend/innovisionaries/
-frontend/
+# Frontend & Root Node Modules
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.local
+frontend/.env
+frontend/.env.local

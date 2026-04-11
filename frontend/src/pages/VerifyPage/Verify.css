@@ -1,0 +1,41 @@
+.verify-tab {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  font-family: var(--font);
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--fg3);
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+  transition: all 0.2s;
+  margin-bottom: -13px; /* overlap border */
+}
+
+.verify-tab:hover {
+  color: var(--fg);
+}
+
+.verify-tab.active {
+  color: var(--fg);
+  border-bottom-color: var(--accent2);
+}
+
+.form-input {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--fg);
+  font-size: 13px;
+  padding: 8px 12px;
+  outline: none;
+  font-family: var(--font);
+  transition: border-color 0.2s;
+}
+
+.form-input:focus {
+  border-color: #444c56;
+}

@@ -1,0 +1,2 @@
+REQ-01: Ensure high capital ratio. The bank must maintain at least 9% capital adequacy at all times.
+REQ-02: User Data Storage. Must store user data on secure, encrypted servers.
