@@ -223,13 +223,14 @@ Example:
     audit_json["trust_gate"] = trust_gate.model_dump() if trust_gate else None
     audit_json["edition_conflicts"] = [c.model_dump() for c in edition_conflicts]
 
-    # 6. Save the Audit Log into SQLite Database
+    # 6. Save the Audit Log into SQLite Database (including trust gate status)
+    trust_status_str = trust_gate.status if trust_gate else ""
     conn = get_sqlite_conn()
     cursor = conn.cursor()
     cursor.execute('''
-        INSERT INTO audit_logs (timestamp, query, audit_data_json)
-        VALUES (?, ?, ?)
-    ''', (audit_json["timestamp"], query, json.dumps(audit_json)))
+        INSERT INTO audit_logs (timestamp, query, trust_gate_status, audit_data_json)
+        VALUES (?, ?, ?, ?)
+    ''', (audit_json["timestamp"], query, trust_status_str, json.dumps(audit_json)))
     log_id = cursor.lastrowid
     conn.commit()
     conn.close()

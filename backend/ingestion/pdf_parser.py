@@ -191,16 +191,17 @@ def detect_sections(pages: list[dict]) -> list[dict]:
     if current_section is not None:
         sections.append(current_section)
 
-    # Fallback: if NO sections detected, treat entire document as one section
+    # Fallback: if NO sections detected, treat each page as its own section
     if not sections:
-        full_text = "\n\n".join(p["text"] for p in pages if p["text"])
-        sections.append({
-            "section_id": "0.0",
-            "section_title": "Full Document",
-            "text": full_text,
-            "start_page": 1,
-        })
-        logger.warning("No section headers detected — treating entire PDF as a single section")
+        logger.warning("No section headers detected — treating each page as its own section")
+        for page in pages:
+            if page["text"]:
+                sections.append({
+                    "section_id":    f"UNSTRUCTURED-p{page['page_number']}",
+                    "section_title": f"Page {page['page_number']} (unstructured)",
+                    "text":          page["text"],
+                    "start_page":    page["page_number"],
+                })
 
     logger.info(f"Detected {len(sections)} sections")
     return sections

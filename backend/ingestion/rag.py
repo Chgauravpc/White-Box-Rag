@@ -8,21 +8,24 @@ into individual claims with source citations.
 import logging
 import re
 
+import spacy
+import numpy as np
 from shared.gemini import call_gemini
 from shared.models import ChunkMetadata, Claim, RAGResponse
-from ingestion.retriever import hybrid_retrieve
+from shared.xai_matrices import build_attribution_matrix, attribute_sentence
 
 logger = logging.getLogger(__name__)
 
+# Load spacy for sentence splitting
+nlp = spacy.load("en_core_web_sm")
 
 # ──────────────────────────────────────────────
 #  Prompt Templates
 # ──────────────────────────────────────────────
 
-RAG_SYSTEM_PROMPT = """You are an RBI regulatory expert. Answer ONLY using the provided source sections.
-For EACH claim or sentence in your answer, cite the source using the exact citation key in square brackets, like [FSR·Jun2024·1.1].
-If the sources don't support a claim, explicitly say "insufficient evidence".
+RAG_SYSTEM_PROMPT = """You are an RBI regulatory expert. Answer ONLY using the provided sources.
 Do NOT hallucinate or add information not present in the sources.
+Write a clear, professional narrative. Do NOT include arbitrary inline citations like brackets or keys.
 Structure your answer clearly with proper paragraphs."""
 
 RAG_USER_TEMPLATE = """Sources:
@@ -35,89 +38,60 @@ Question: {query}"""
 #  Source Formatting
 # ──────────────────────────────────────────────
 
-def _make_citation_key(chunk: ChunkMetadata, index: int) -> str:
-    """Create a citation key like FSR·Jun2024·1.1·c0"""
-    edition_short = chunk.edition_date.replace(" ", "")
-    return f"{chunk.publication_name}·{edition_short}·{chunk.section_id}·c{index}"
-
-
-def format_sources(chunks: list[ChunkMetadata]) -> str:
-    """Format chunks for inclusion in the RAG prompt.
-
-    Each chunk is prefixed with its citation key so Gemini
-    can reference it in the answer.
-    """
+def format_sources(chunks: list[dict]) -> str:
+    """Format chunks for inclusion in the RAG prompt."""
     formatted = []
-    for i, chunk in enumerate(chunks):
-        key = _make_citation_key(chunk, i)
-        formatted.append(f"[{key}] {chunk.chunk_text}")
+    for chunk in chunks:
+        key = f"{chunk['publication_name']}·{chunk['edition_date']}·{chunk['section_id']}"
+        formatted.append(f"[{key}] {chunk['chunk_text']}")
     return "\n\n".join(formatted)
 
 
 # ──────────────────────────────────────────────
-#  Claim Extraction
+#  Claim Extraction (Matrix Engine)
 # ──────────────────────────────────────────────
 
-# Regex to find citation references: [FSR·Jun2024·1.1]
-CITATION_PATTERN = re.compile(r"\[([^\]]+)\]")
-
-
-def _find_chunk_by_key(
-    citation_key: str, chunks: list[ChunkMetadata]
-) -> ChunkMetadata | None:
-    """Find the chunk matching a citation key."""
-    for i, chunk in enumerate(chunks):
-        if _make_citation_key(chunk, i) == citation_key:
-            return chunk
-    return None
-
-
-def parse_claims(answer: str, chunks: list[ChunkMetadata]) -> list[Claim]:
-    """Parse the Gemini response to extract individual claims with citations.
-
-    Strategy:
-      1. Split the answer into sentences.
-      2. For each sentence, extract citation keys via regex.
-      3. Match citation keys back to source chunks.
-      4. Create a Claim object per sentence.
+def parse_claims(answer: str, chunks: list[dict]) -> tuple[list[Claim], np.ndarray]:
+    """Parse claims deterministically using Matrix 3 (Attribution Matrix).
+    
+    1. Splits response into sentences via spacy.
+    2. Builds Attribution Matrix A using sentence-transformers.
+    3. Maps each sentence mathematically to the best chunk (if score >= threshold).
     """
-    # Split into sentences (rough split on ., !, ? followed by space/newline)
-    sentences = re.split(r"(?<=[.!?])\s+", answer.strip())
-
+    doc = nlp(answer)
+    sentences = [sent.text.strip() for sent in doc.sents if sent.text.strip()]
+    
+    if not sentences or not chunks:
+        return [], np.array([])
+        
+    # Build Matrix 3 (A)
+    A = build_attribution_matrix(sentences, chunks)
+    
     claims = []
-    for sentence in sentences:
-        sentence = sentence.strip()
-        if not sentence:
-            continue
-
-        # Find all citation keys in this sentence
-        citations = CITATION_PATTERN.findall(sentence)
-
-        if citations:
-            # Use the first citation as the primary source
-            primary_key = citations[0]
-            source_chunk = _find_chunk_by_key(primary_key, chunks)
-
+    for i, sentence in enumerate(sentences):
+        attr = attribute_sentence(A[i], chunks)
+        
+        if attr:
             claims.append(Claim(
                 text=sentence,
-                source_publication=source_chunk.publication_name if source_chunk else "",
-                source_edition=source_chunk.edition_date if source_chunk else "",
-                source_section_id=source_chunk.section_id if source_chunk else "",
-                source_passage=source_chunk.chunk_text[:500] if source_chunk else "",
-                confidence=1.0,  # BP2's NLI engine will overwrite this
+                source_publication=attr["publication_name"],
+                source_edition=attr["edition_date"],
+                source_section_id=attr["section_id"],
+                source_passage=attr["source_passage"],
+                confidence=attr["attribution_score"]  # Initial proxy confidence
             ))
         else:
-            # Sentence with no citation
+            # Unattributable
             claims.append(Claim(
                 text=sentence,
                 source_publication="",
                 source_edition="",
                 source_section_id="",
                 source_passage="",
-                confidence=0.5,  # Lower confidence for uncited claims
+                confidence=0.0
             ))
-
-    return claims
+            
+    return claims, A
 
 
 # ──────────────────────────────────────────────
@@ -125,26 +99,17 @@ def parse_claims(answer: str, chunks: list[ChunkMetadata]) -> list[Claim]:
 # ──────────────────────────────────────────────
 
 async def rag_query(
-    query: str, filters: dict | None = None
-) -> RAGResponse:
-    """Execute the full RAG pipeline.
-
-    1. Retrieve top-10 chunks via hybrid retrieval.
-    2. Format sources and build the Gemini prompt.
-    3. Call Gemini Pro to generate an attributed answer.
-    4. Parse claims from the response.
-    5. Return a structured RAGResponse.
+    query: str, chunks: list[dict]
+) -> tuple[RAGResponse, np.ndarray]:
+    """Execute the full RAG pipeline using pure Math extraction.
 
     Args:
         query: The user's natural language question.
-        filters: Optional metadata filters (publication_name, edition_date).
+        chunks: Pre-retrieved list of dictionaries representing chunks.
 
     Returns:
-        RAGResponse with answer text and structured claims list.
+        (RAGResponse, Matrix A)
     """
-    # 1. Retrieve
-    chunks = hybrid_retrieve(query, top_k=10, filters=filters)
-
     if not chunks:
         return RAGResponse(
             answer="No relevant documents found. Please ingest RBI publications first.",
@@ -159,7 +124,7 @@ async def rag_query(
     )
 
     # 3. Call Gemini
-    logger.info(f"RAG query: '{query[:80]}...' with {len(chunks)} source chunks")
+    logger.info(f"RAG gen for query '{query[:80]}...' with {len(chunks)} sources")
 
     answer = await call_gemini(
         prompt=user_prompt,
@@ -167,9 +132,9 @@ async def rag_query(
         temperature=0.2,
     )
 
-    # 4. Parse claims
-    claims = parse_claims(answer, chunks)
+    # 4. Math Attribution (Matrix 3)
+    claims, A_matrix = parse_claims(answer, chunks)
 
-    logger.info(f"RAG response: {len(claims)} claims extracted")
+    logger.info(f"RAG Math Attribution: {len(claims)} sentences analyzed")
 
-    return RAGResponse(answer=answer, claims=claims)
+    return RAGResponse(answer=answer, claims=claims), A_matrix

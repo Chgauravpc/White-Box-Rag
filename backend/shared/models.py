@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -67,7 +67,8 @@ class Claim(BaseModel):
     source_publication: str = Field(default="", description="Publication code of the source")
     source_edition: str = Field(default="", description="Edition date of the source")
     source_section_id: str = Field(default="", description="Section ID cited for this claim")
-    source_passage: str = Field(default="", description="The actual source passage backing this claim")
+    source_passage: str = Field(default="", description="Full source chunk — for human reading")
+    focused_passage: str = Field(default="", description="Top-K sentences fed to NLI — for audit")
     confidence: float = Field(default=1.0, ge=0.0, le=1.0, description="Confidence score (BP2 overwrites)")
 
 
@@ -153,6 +154,55 @@ class BRDRequirement(BaseModel):
     remediation: str = Field(default="")
 
 
+class RetrievalMatrix(BaseModel):
+    chunk_ids: list[str] = Field(description="section IDs, length n")
+    similarity_scores: list[float] = Field(description="S vector, length n")
+
+class EntailmentMatrix(BaseModel):
+    claim_texts:   list[str] = Field(description="length m")
+    passage_ids:   list[str] = Field(description="section IDs only, e.g. FSR-§I.2.1")
+    passage_texts: list[str] = Field(default_factory=list, description="raw passage text for audit display")
+    scores:        list[list[list[float]]] = Field(description="shape (m, n, 3) — E[i][j] = [contradiction, entailment, neutral] probs")
+    labels:        list[str] = Field(default=["contradiction", "entailment", "neutral"])
+
+class AttributionMatrix(BaseModel):
+    sentence_texts:       list[str] = Field(description="length m")
+    chunk_ids:            list[str] = Field(description="length n")
+    scores:               list[list[float]] = Field(description="shape (m, n) — A matrix")
+    primary_attributions: list[dict] = Field(
+        default_factory=list,
+        description="Pre-computed top attribution per sentence with runner-up and confidence gap"
+    )
+
+class ConflictMatrix(BaseModel):
+    old_section_ids: list[str] = Field(description="length p")
+    new_section_ids: list[str] = Field(description="length q")
+    scores: list[list[float]] = Field(description="shape (p, q) — C matrix, contradiction probs")
+    threshold: float = Field(description="what was used to flag conflicts")
+
+class ShapleyContributions(BaseModel):
+    claim_texts: list[str]
+    shapley_values: list[float] = Field(description="φᵢ per claim")
+    penalty_reasons: list[list[str]] = Field(description="reasons per claim")
+    overall_score: float
+
+class XAIArtifacts(BaseModel):
+    retrieval: RetrievalMatrix
+    entailment: EntailmentMatrix
+    attribution: AttributionMatrix
+    conflict: Optional[ConflictMatrix] = None
+    shapley: ShapleyContributions
+
+
+class RelatedQuery(BaseModel):
+    """A past query semantically similar to the current query."""
+    id: int
+    timestamp: str
+    query: str
+    cosine_similarity: float = Field(description="cos(q_current, q_past) ∈ [0,1]")
+    trust_status: str = Field(default="")
+
+
 class AuditReport(BaseModel):
     """Full audit trail for a governance interaction."""
     id: Optional[int] = None
@@ -163,6 +213,10 @@ class AuditReport(BaseModel):
     verifications: list[VerificationResult] = Field(default_factory=list)
     trust_gate: Optional[TrustGate] = None
     edition_conflicts: list[EditionConflict] = Field(default_factory=list)
+    # XAI Mathematical Artifacts
+    xai_artifacts: Optional[XAIArtifacts] = None
+    related_queries: List[RelatedQuery] = Field(default_factory=list,
+        description="Past queries with high cosine similarity to this query")
 
 
 # ──────────────────────────────────────────────

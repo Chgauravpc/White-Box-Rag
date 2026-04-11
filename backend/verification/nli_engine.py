@@ -1,55 +1,52 @@
-import json
-from typing import List
+from typing import List, Tuple
+import numpy as np
+
 from shared.models import Claim, VerificationResult, NLIVerdict
-from shared.gemini import call_gemini
+from shared.xai_matrices import verify_claims_batch, build_entailment_matrix
 
-async def verify_claim(claim: Claim) -> VerificationResult:
-    """Verifies a single claim against its source passage using NLI."""
-    prompt = f"""
-    You are a Natural Language Inference expert. Determine the relationship between:
 
-    PREMISE (source passage): {claim.source_passage}
-    HYPOTHESIS (generated claim): {claim.text}
+async def verify_all_claims(
+    claims: List[Claim],
+) -> Tuple[List[VerificationResult], np.ndarray, List[str]]:
+    """Verifies claims via batched DeBERTa CrossEncoder (Matrix 2).
 
-    Classify as exactly one of:
-    - ENTAILMENT: The premise fully supports the hypothesis
-    - CONTRADICTION: The premise contradicts the hypothesis
-    - NEUTRAL: The premise neither supports nor contradicts
-
-    Respond with JSON exactly in this format without any additional text:
-    {{
-      "verdict": "ENTAILMENT" | "CONTRADICTION" | "NEUTRAL",
-      "confidence": <float between 0.0 and 1.0>,
-      "explanation": "<detailed reasoning>"
-    }}
+    Returns:
+        (verifications, E_matrix, focused_passages)
+        focused_passages[i] is the sentence subset actually fed to NLI for claim i —
+        stored in Claim.focused_passage for full audit traceability.
     """
-    
-    # Prompt Gemini directly.
-    try:
-        response_text = await call_gemini(prompt, temperature=0.1)
-        response_text = response_text.strip()
-        if response_text.startswith("```json"): response_text = response_text[7:]
-        if response_text.startswith("```"): response_text = response_text[3:]
-        if response_text.endswith("```"): response_text = response_text[:-3]
-        response_data = json.loads(response_text.strip())
-    except Exception as e:
-         return VerificationResult(
-            claim_text=claim.text,
-            verdict=NLIVerdict.NEUTRAL,
-            entailment_score=0.0,
-            explanation=f"Error evaluating claim: {e}"
-         )
-         
-    return VerificationResult(
-        claim_text=claim.text,
-        verdict=response_data.get("verdict", NLIVerdict.NEUTRAL),
-        entailment_score=float(response_data.get("confidence", 0.0)),
-        explanation=response_data.get("explanation", "No reasoning provided.")
-    )
+    if not claims:
+        return [], np.array([]), []
 
-import asyncio
-async def verify_all_claims(claims: List[Claim]) -> List[VerificationResult]:
-    """Verifies a list of claims using NLI."""
-    tasks = [verify_claim(claim) for claim in claims]
-    return await asyncio.gather(*tasks)
+    pairs = [(claim.text, claim.source_passage) for claim in claims]
 
+    # Batched NLI — also applies extract_relevant_sentences() internally
+    raw_results = verify_claims_batch(pairs)
+
+    verifications    = []
+    focused_passages = []
+    for claim, result in zip(claims, raw_results):
+        verifications.append(
+            VerificationResult(
+                claim_text=claim.text,
+                verdict=result["verdict"],
+                entailment_score=result["entailment_score"],
+                explanation=(
+                    f"CrossEncoder Probabilities -> "
+                    f"Entail: {result['entailment_score']:.2f}, "
+                    f"Contradict: {result['contradiction_score']:.2f}, "
+                    f"Neutral: {result['neutral_score']:.2f}"
+                )
+            )
+        )
+        focused_passages.append(result.get("focused_passage", claim.source_passage))
+
+    # Build full E matrix for XAI visualization
+    claim_texts = [c.text for c in claims]
+    passages    = list(dict.fromkeys([c.source_passage for c in claims if c.source_passage]))
+    if passages:
+        E_matrix, _ = build_entailment_matrix(claim_texts, passages)
+    else:
+        E_matrix = np.array([])
+
+    return verifications, E_matrix, focused_passages

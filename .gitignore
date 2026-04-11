@@ -42,3 +42,13 @@ Thumbs.db
 *.egg-info/
 dist/
 build/
+
+# Tests — exclude test files and test artefacts from source control
+backend/tests/
+backend/conftest.py
+backend/test_*.py
+**/test_*.py
+htmlcov/
+.coverage
+coverage.xml
+

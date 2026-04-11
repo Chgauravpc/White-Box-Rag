@@ -135,27 +135,14 @@ def rebuild_bm25_index():
 #  Dense Search (ChromaDB)
 # ──────────────────────────────────────────────
 
-def dense_search(
+def dense_search_with_scores(
     query: str, top_k: int = DENSE_TOP_K, filters: dict | None = None
-) -> list[ChunkMetadata]:
-    """Query ChromaDB with dense (all-MiniLM-L6-v2) embeddings.
-
-    Args:
-        query: Search query text.
-        top_k: Number of results.
-        filters: Optional ChromaDB where-clause, e.g. {"publication_name": "FSR"}.
-
-    Returns:
-        List of ChunkMetadata, ordered by similarity (best first).
-    """
+) -> list[tuple[ChunkMetadata, float]]:
+    """Same as dense_search() but also returns the distance/similarity score."""
     collection = get_chroma_collection()
 
     where = None
     if filters:
-        # ChromaDB where clause supports simple equality:
-        #   {"publication_name": "FSR"}
-        # For multiple filters, use $and:
-        #   {"$and": [{"publication_name": "FSR"}, {"edition_date": "June 2024"}]}
         if len(filters) == 1:
             where = filters
         else:
@@ -165,24 +152,37 @@ def dense_search(
         query_texts=[query],
         n_results=top_k,
         where=where,
-        include=["documents", "metadatas"],
+        include=["documents", "metadatas", "distances"],
     )
 
-    chunks = []
+    chunks_with_scores = []
     if results and results["documents"]:
-        for doc, meta in zip(results["documents"][0], results["metadatas"][0]):
-            chunks.append(
-                ChunkMetadata(
-                    publication_name=meta.get("publication_name", ""),
-                    edition_date=meta.get("edition_date", ""),
-                    section_id=meta.get("section_id", ""),
-                    section_title=meta.get("section_title", ""),
-                    page_number=meta.get("page_number", 0),
-                    chunk_text=doc,
-                )
+        for doc, meta, dist in zip(
+            results["documents"][0],
+            results["metadatas"][0],
+            results["distances"][0],
+        ):
+            # ChromaDB cosine distance: dist=0 means identical, dist=2 means opposite
+            # Convert to cosine similarity: sim = 1 - dist (for cosine space)
+            cosine_sim = round(1.0 - dist, 6)
+            chunk = ChunkMetadata(
+                publication_name=meta.get("publication_name", ""),
+                edition_date=meta.get("edition_date", ""),
+                section_id=meta.get("section_id", ""),
+                section_title=meta.get("section_title", ""),
+                page_number=meta.get("page_number", 0),
+                chunk_text=doc,
             )
+            chunks_with_scores.append((chunk, cosine_sim))
 
-    return chunks
+    return chunks_with_scores
+
+
+def dense_search(
+    query: str, top_k: int = DENSE_TOP_K, filters: dict | None = None
+) -> list[ChunkMetadata]:
+    """Query ChromaDB with dense (all-MiniLM-L6-v2) embeddings."""
+    return [chunk for chunk, _ in dense_search_with_scores(query, top_k, filters)]
 
 
 # ──────────────────────────────────────────────
@@ -240,30 +240,71 @@ def hybrid_retrieve(
     top_k: int = FINAL_TOP_K,
     filters: dict | None = None,
 ) -> list[ChunkMetadata]:
-    """Hybrid retrieval: dense + BM25 + Reciprocal Rank Fusion.
+    """Hybrid retrieval: dense + BM25 + Reciprocal Rank Fusion."""
+    chunks, _ = hybrid_retrieve_with_scores(query, top_k, filters)
+    return chunks
 
-    Args:
-        query: The user's natural language question.
-        top_k: Final number of results to return.
-        filters: Optional metadata filters (publication_name, edition_date).
+
+def hybrid_retrieve_with_scores(
+    query: str,
+    top_k: int = FINAL_TOP_K,
+    filters: dict | None = None,
+) -> tuple[list[ChunkMetadata], list[dict]]:
+    """Hybrid retrieval returning chunks AND per-chunk score data for XAI matrix.
 
     Returns:
-        Top-K ChunkMetadata objects, ranked by hybrid relevance.
+        (chunks, score_records) where score_records contains dense_score,
+        bm25_score, rrf_score and rank for each chunk.
     """
-    # 1. Dense search via ChromaDB
-    dense_results = dense_search(query, top_k=DENSE_TOP_K, filters=filters)
+    # 1. Dense search with scores
+    dense_with_scores = dense_search_with_scores(query, top_k=DENSE_TOP_K, filters=filters)
+    dense_results = [chunk for chunk, _ in dense_with_scores]
+    dense_score_map = {
+        f"{c.publication_name}|{c.edition_date}|{c.section_id}|{c.chunk_text[:80]}": s
+        for c, s in dense_with_scores
+    }
 
     # 2. Sparse search via BM25
     bm25 = get_bm25_index()
     sparse_results = bm25.search(query, top_k=SPARSE_TOP_K, filters=filters)
+    bm25_score_map = {
+        f"{c.publication_name}|{c.edition_date}|{c.section_id}|{c.chunk_text[:80]}": s
+        for c, s in sparse_results
+    }
 
     # 3. Fuse results
     fused = reciprocal_rank_fusion(dense_results, sparse_results)
 
+    def _key(chunk: ChunkMetadata) -> str:
+        return f"{chunk.publication_name}|{chunk.edition_date}|{chunk.section_id}|{chunk.chunk_text[:80]}"
+
+    # 4. Build RRF scores
+    rrf_scores: dict[str, float] = defaultdict(float)
+    for rank, chunk in enumerate(dense_results):
+        rrf_scores[_key(chunk)] += 1.0 / (RRF_K + rank + 1)
+    for rank, (chunk, _) in enumerate(sparse_results):
+        rrf_scores[_key(chunk)] += 1.0 / (RRF_K + rank + 1)
+
+    # 5. Build score records for the similarity matrix
+    top_fused = fused[:top_k]
+    score_records = []
+    for rank, chunk in enumerate(top_fused):
+        k = _key(chunk)
+        chunk_id = f"{chunk.publication_name}_{chunk.edition_date}_{chunk.section_id}_c{rank}"
+        score_records.append({
+            "chunk_id": chunk_id,
+            "section_id": chunk.section_id,
+            "publication": chunk.publication_name,
+            "edition": chunk.edition_date,
+            "dense_score": dense_score_map.get(k, 0.0),
+            "bm25_score": bm25_score_map.get(k, 0.0),
+            "rrf_score": round(rrf_scores.get(k, 0.0), 8),
+            "rank": rank + 1,
+        })
+
     logger.info(
-        f"Hybrid retrieve: query='{query[:50]}...', "
-        f"dense={len(dense_results)}, sparse={len(sparse_results)}, "
-        f"fused={len(fused)}, returning top {top_k}"
+        f"Hybrid retrieve with scores: dense={len(dense_results)}, "
+        f"sparse={len(sparse_results)}, fused={len(fused)}, top {top_k}"
     )
 
-    return fused[:top_k]
+    return top_fused, score_records

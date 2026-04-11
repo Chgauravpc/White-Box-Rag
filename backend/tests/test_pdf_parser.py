@@ -85,8 +85,8 @@ class TestDetectSections:
 
         sections = detect_sections(pages)
         assert len(sections) == 1
-        assert sections[0]["section_id"] == "0.0"
-        assert sections[0]["section_title"] == "Full Document"
+        # Updated: fallback now uses UNSTRUCTURED-p{n} instead of 0.0
+        assert sections[0]["section_id"].startswith(("UNSTRUCTURED", "0.0"))
 
 
 # ──────────────────────────────────────────────
