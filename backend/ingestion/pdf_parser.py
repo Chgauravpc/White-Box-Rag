@@ -25,9 +25,15 @@ NUMBERED_SECTION = re.compile(
     r"^(\d+\.\d+(?:\.\d+)?)\s+([A-Z][\w\s\-:,&/()]+)", re.MULTILINE
 )
 
-# Matches:  Chapter I,  Chapter II,  Section III,  Section IV
+# Matches:  Chapter I,  Chapter II,  Section III,  Section IV, Part-II
 ROMAN_SECTION = re.compile(
-    r"^(Chapter|Section)\s+(I{1,3}|IV|V|VI{0,3}|IX|X)[:\s]+(.+)",
+    r"^(Chapter|Section|Part)-?\s*(I{1,3}|IV|V|VI{0,3}|IX|X)[:\.\s]+(.+)",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+# Matches: I.8.4 Investment in bonds
+ROMAN_NUMBERED_SECTION = re.compile(
+    r"^((?:I{1,3}|IV|V|VI{0,3}|IX|X)(?:\.\d+)+)(?:\.)?\s+([A-Z][\w\s\-:,&/()]+)",
     re.MULTILINE | re.IGNORECASE,
 )
 
@@ -135,6 +141,23 @@ def detect_sections(pages: list[dict]) -> list[dict]:
                     current_section = {
                         "section_id": f"{section_type}_{roman}",
                         "section_title": title,
+                        "text": "",
+                        "start_page": page_num,
+                    }
+                    matched = True
+
+            # Try roman numbered: I.8.4 Investment
+            if not matched:
+                m = ROMAN_NUMBERED_SECTION.match(line_stripped)
+                if m:
+                    if current_section is not None:
+                        current_section["text"] += "\n".join(buffer) + "\n"
+                        sections.append(current_section)
+                    buffer = []
+
+                    current_section = {
+                        "section_id": m.group(1),
+                        "section_title": m.group(2).strip(),
                         "text": "",
                         "start_page": page_num,
                     }

@@ -35,10 +35,10 @@ Question: {query}"""
 #  Source Formatting
 # ──────────────────────────────────────────────
 
-def _make_citation_key(chunk: ChunkMetadata) -> str:
-    """Create a citation key like FSR·Jun2024·1.1"""
+def _make_citation_key(chunk: ChunkMetadata, index: int) -> str:
+    """Create a citation key like FSR·Jun2024·1.1·c0"""
     edition_short = chunk.edition_date.replace(" ", "")
-    return f"{chunk.publication_name}·{edition_short}·{chunk.section_id}"
+    return f"{chunk.publication_name}·{edition_short}·{chunk.section_id}·c{index}"
 
 
 def format_sources(chunks: list[ChunkMetadata]) -> str:
@@ -48,8 +48,8 @@ def format_sources(chunks: list[ChunkMetadata]) -> str:
     can reference it in the answer.
     """
     formatted = []
-    for chunk in chunks:
-        key = _make_citation_key(chunk)
+    for i, chunk in enumerate(chunks):
+        key = _make_citation_key(chunk, i)
         formatted.append(f"[{key}] {chunk.chunk_text}")
     return "\n\n".join(formatted)
 
@@ -66,8 +66,8 @@ def _find_chunk_by_key(
     citation_key: str, chunks: list[ChunkMetadata]
 ) -> ChunkMetadata | None:
     """Find the chunk matching a citation key."""
-    for chunk in chunks:
-        if _make_citation_key(chunk) == citation_key:
+    for i, chunk in enumerate(chunks):
+        if _make_citation_key(chunk, i) == citation_key:
             return chunk
     return None
 
