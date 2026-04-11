@@ -52,3 +52,6 @@ htmlcov/
 .coverage
 coverage.xml
 
+
+backend/innovisionaries/
+frontend/
