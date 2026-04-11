@@ -17,10 +17,18 @@ from pydantic import BaseModel, ConfigDict, Field
 # ──────────────────────────────────────────────
 
 class NLIVerdict(str, Enum):
-    """Natural Language Inference verdict for a claim."""
+    """Natural Language Inference verdict for a claim.
+    
+    Canonical values: SUPPORTED, CONTRADICTED, NOT_ENOUGH_INFO
+    Aliases (BP2 compatibility): ENTAILMENT, CONTRADICTION, NEUTRAL
+    """
     SUPPORTED = "SUPPORTED"
     CONTRADICTED = "CONTRADICTED"
     NOT_ENOUGH_INFO = "NOT_ENOUGH_INFO"
+    # BP2 aliases
+    ENTAILMENT = "ENTAILMENT"
+    CONTRADICTION = "CONTRADICTION"
+    NEUTRAL = "NEUTRAL"
 
 
 class TrustStatus(str, Enum):

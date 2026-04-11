@@ -23,10 +23,17 @@ from shared.models import (
     QueryRequest,
     RAGResponse,
     SectionInfo,
+    AuditReport,
+    BRDRequirement
 )
 from ingestion.pdf_parser import ingest_pdf
 from ingestion.rag import rag_query
 from ingestion.retriever import rebuild_bm25_index
+
+from verification.nli_engine import verify_all_claims
+from verification.trust_gate import compute_trust_gate
+from compliance.mapper import map_requirement
+from compliance.audit import generate_audit_report
 
 logger = logging.getLogger(__name__)
 
@@ -98,23 +105,57 @@ async def ingest_document(
 #  POST /api/query
 # ──────────────────────────────────────────────
 
-@router.post("/query", response_model=RAGResponse)
+@router.post("/query", response_model=AuditReport)
 async def query_documents(request: QueryRequest):
-    """Ask a question and get a RAG-generated answer with claim-level citations.
-
-    Optionally filter by publication_name and/or edition_date.
-    """
+    """Ask a question and get a fully integrated RAG answer + Verification + Compliance Audit."""
     try:
-        response = await rag_query(
+        # Step 1: BP1 - RAG Query
+        logger.info(f"Step 1: Running RAG for query: '{request.query}'")
+        rag_response = await rag_query(
             query=request.query,
             filters=request.filters,
         )
-        return response
+
+        # Step 2: BP2 - NLI Verification & Trust Gate
+        logger.info("Step 2: BP2 - Verifying claims using NLI")
+        verifications = await verify_all_claims(rag_response.claims)
+        trust_gate = compute_trust_gate(verifications, [])
+
+        # Step 3: BP3 - Validate query as Business Requirement
+        logger.info("Step 3: BP3 - Mapping requirement gaps")
+        brd_req = BRDRequirement(id="ASK", text=request.query)
+        mapped_dict = await map_requirement(brd_req)
+        
+        # Populate BRDRequirement fields from mapped_dict
+        brd_req.mapped_sections = [c.chunk_text for c in mapped_dict.get("relevant_chunks", [])]
+        brd_req.alignment_score = mapped_dict.get("alignment_score", 0.0)
+        brd_req.gaps = mapped_dict.get("gaps", [])
+        brd_req.risk_flags = mapped_dict.get("violations", [])
+        brd_req.risk_level = mapped_dict.get("risk_level", "LOW")
+        brd_req.remediation = mapped_dict.get("remediation_suggestions", "")
+        
+        brd_results = [brd_req]
+
+        # Step 4: BP3 - Generate Comprehensive Audit Report
+        logger.info("Step 4: BP3 - Compiling Audit Report")
+        audit_report_dict = await generate_audit_report(
+            query=request.query,
+            rag_response=rag_response.answer,
+            claims=rag_response.claims,
+            verifications=verifications,
+            trust_gate=trust_gate,
+            edition_conflicts=[],
+            brd_results=brd_results
+        )
+
+        return audit_report_dict
 
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error(f"Query failed: {e}")
+        logger.error(f"Unified Query pipeline failed: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Query processing failed: {str(e)}")
 
 

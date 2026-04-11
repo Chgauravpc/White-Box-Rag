@@ -1,0 +1,4 @@
+REQ-001: System must comply with RBI data localization guidelines. All payment data must be stored exclusively within India.
+REQ-002: KYC verification must follow RBI norms and be fully completed before a user can make any transactions.
+REQ-003: Transaction logs must be stored securely for audit purposes for a minimum duration as specified in the FSR.
+REQ-004: All cross-border remittances must adhere to FEMA regulations strictly.

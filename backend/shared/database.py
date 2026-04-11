@@ -63,7 +63,8 @@ def _init_sqlite_tables(conn: sqlite3.Connection):
             timestamp       TEXT NOT NULL,
             query           TEXT NOT NULL,
             response_json   TEXT,
-            trust_gate_status TEXT
+            trust_gate_status TEXT,
+            audit_data_json TEXT
         );
     """)
     conn.commit()
@@ -143,3 +144,12 @@ def list_audit_logs() -> list[dict]:
         return [dict(row) for row in rows]
     finally:
         conn.close()
+
+
+# ──────────────────────────────────────────────
+#  Alias for BP3 compatibility
+# ──────────────────────────────────────────────
+
+def get_sqlite_conn() -> sqlite3.Connection:
+    """Alias for get_sqlite_connection() — used by BP3 compliance module."""
+    return get_sqlite_connection()
