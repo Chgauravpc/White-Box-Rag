@@ -52,9 +52,4 @@ htmlcov/
 .coverage
 # Frontend & Root Node Modules
 node_modules/
-frontend/node_modules/
-frontend/dist/
-frontend/.env
-frontend/.env.local
-frontend/.env
-frontend/.env.local
+frontend/
