@@ -31,7 +31,7 @@ class TestDetectSections:
             }
         ]
 
-        sections = detect_sections(pages)
+        sections, structured = detect_sections(pages)
 
         assert len(sections) == 2
         assert sections[0]["section_id"] == "1.1"
@@ -57,7 +57,7 @@ class TestDetectSections:
             }
         ]
 
-        sections = detect_sections(pages)
+        sections, structured = detect_sections(pages)
 
         assert len(sections) == 2
         assert sections[0]["section_id"] == "Chapter_I"
@@ -70,7 +70,7 @@ class TestDetectSections:
             {"page_number": 2, "text": "1.1 Some Section\nSome content here."},
         ]
 
-        sections = detect_sections(pages)
+        sections, structured = detect_sections(pages)
         assert len(sections) == 1
         assert sections[0]["section_id"] == "1.1"
 
@@ -83,10 +83,34 @@ class TestDetectSections:
             }
         ]
 
-        sections = detect_sections(pages)
+        sections, structured = detect_sections(pages)
         assert len(sections) == 1
         # Updated: fallback now uses UNSTRUCTURED-p{n} instead of 0.0
         assert sections[0]["section_id"].startswith(("UNSTRUCTURED", "0.0"))
+        assert structured is False
+
+    def test_generic_numbered_fallback(self):
+        """Single-level numbered headers (e.g. contracts) are picked up by the
+        generic fallback pass when no financial-report-style headers exist."""
+        pages = [
+            {
+                "page_number": 1,
+                "text": (
+                    "1. Definitions\n"
+                    "In this agreement, the following terms apply.\n"
+                    "\n"
+                    "2. Term and Termination\n"
+                    "This agreement remains in effect until terminated."
+                ),
+            }
+        ]
+
+        sections, structured = detect_sections(pages)
+        assert len(sections) == 2
+        assert sections[0]["section_id"] == "1"
+        assert sections[0]["section_title"] == "Definitions"
+        assert sections[1]["section_id"] == "2"
+        assert structured is True
 
 
 # ──────────────────────────────────────────────

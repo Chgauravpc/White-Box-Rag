@@ -1,5 +1,5 @@
 """
-Centralised configuration for the XAI Governance Framework.
+Centralised configuration for the White Box RAG governance framework.
 Loads settings from .env file at the project root.
 """
 
@@ -18,7 +18,11 @@ CHROMA_PATH = os.getenv("CHROMA_PATH", "./data/chromadb")
 SQLITE_PATH = os.getenv("SQLITE_PATH", "./data/metadata.db")
 
 # ---------- Domain Constants ----------
-PUBLICATIONS = ["FSR", "MPR", "PSR", "FER"]
+# Domain-agnostic: "publication"/"collection" is a free-text label chosen at
+# ingest time, not a fixed enum. Any non-empty, reasonably-sized string is valid
+# (see ingestion/routes.py::_validate_collection_label). This system is not
+# restricted to any single domain (finance, legal, engineering, etc.).
+MAX_COLLECTION_LABEL_LENGTH = 64
 
 # ---------- Chunking Defaults ----------
 CHUNK_MAX_TOKENS = 512

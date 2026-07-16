@@ -1,15 +1,17 @@
+import json
 import os
 import logging
 import aiofiles
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from pydantic import BaseModel
 
 from compliance.brd_parser import parse_brd
 from compliance.mapper import map_requirement
 from compliance.audit import get_all_logs, get_audit_by_id
 from shared.models import BRDRequirement
+from shared.database import insert_brd_validation_run, list_brd_validation_runs, get_brd_validation_run
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +19,7 @@ router = APIRouter(prefix="", tags=["Compliance & Audit"])
 
 class ValidateRequest(BaseModel):
     requirements: List[str]
+    source_filename: Optional[str] = None
 
 @router.post("/brd/upload")
 async def upload_brd(file: UploadFile = File(...)):
@@ -77,15 +80,53 @@ async def validate_brd(request: ValidateRequest):
             brd_req = BRDRequirement(id="N/A", text=req_text)
             mapped_result = await map_requirement(brd_req)
             results.append(mapped_result)
-            
+
+        # Persist server-side so validation history survives beyond a single
+        # browser session (Streamlit has no localStorage equivalent).
+        scores = [r.get("overall_compliance_score", 0) for r in results if r.get("overall_compliance_score") is not None]
+        overall_score = round(sum(scores) / len(scores), 2) if scores else 0.0
+        run_id = insert_brd_validation_run(
+            source_filename=request.source_filename,
+            requirements_json=json.dumps(request.requirements),
+            results_json=json.dumps(results),
+            overall_score=overall_score,
+        )
+
         return {
             "status": "success",
             "message": "Validation complete",
-            "data": results
+            "data": results,
+            "run_id": run_id,
+            "overall_score": overall_score,
         }
     except Exception as e:
         logger.error(f"Error during validation: {e}")
         return JSONResponse(status_code=500, content={"status": "error", "message": "Failed to validate requirements", "details": str(e)})
+
+
+@router.get("/brd/runs")
+async def list_brd_runs():
+    """List past BRD validation runs (server-side history)."""
+    try:
+        return list_brd_validation_runs()
+    except Exception as e:
+        logger.error(f"Error listing BRD validation runs: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "message": "Failed to list BRD validation runs"})
+
+
+@router.get("/brd/runs/{run_id}")
+async def get_brd_run(run_id: int):
+    """Full detail for a single past BRD validation run."""
+    try:
+        run = get_brd_validation_run(run_id)
+        if not run:
+            return JSONResponse(status_code=404, content={"status": "error", "message": "BRD validation run not found."})
+        run["requirements"] = json.loads(run.pop("requirements_json"))
+        run["results"] = json.loads(run.pop("results_json"))
+        return run
+    except Exception as e:
+        logger.error(f"Error getting BRD validation run {run_id}: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "message": "Failed to retrieve BRD validation run"})
 
 @router.get("/brd/sample")
 async def get_sample_brd():

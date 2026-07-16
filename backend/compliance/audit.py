@@ -27,7 +27,7 @@ async def generate_audit_report(
 
     # 2. Build the exact prompt requested
     prompt = f"""
-You are an RBI compliance auditor and Explainable AI (XAI) specialist.
+You are a compliance auditor and Explainable AI (XAI) specialist.
 
 Your task is to generate a structured audit report explaining how a system arrived at its response and whether it is compliant.
 
@@ -92,7 +92,7 @@ For EACH claim:
 ---
 
 4. **section_reference_registry**
-List ALL RBI sections used:
+List ALL knowledge base sections used:
 - publication_name
 - edition_date
 - section_id
@@ -223,6 +223,12 @@ Example:
     audit_json["trust_gate"] = trust_gate.model_dump() if trust_gate else None
     audit_json["edition_conflicts"] = [c.model_dump() for c in edition_conflicts]
 
+    # Gemini's narrative summary must never be allowed to contradict the
+    # deterministic Trust Gate — overwrite post-hoc rather than trust the LLM's
+    # restatement of a value we already computed mathematically.
+    if trust_gate and isinstance(audit_json.get("final_audit_summary"), dict):
+        audit_json["final_audit_summary"]["overall_trust_status"] = trust_gate.status
+
     # 6. Save the Audit Log into SQLite Database (including trust gate status)
     trust_status_str = trust_gate.status if trust_gate else ""
     conn = get_sqlite_conn()
@@ -243,20 +249,22 @@ def get_all_logs() -> list:
     """Retrieves list of all audit logs with extracted key metrics."""
     conn = get_sqlite_conn()
     cursor = conn.cursor()
-    cursor.execute("SELECT id, timestamp, query, audit_data_json FROM audit_logs ORDER BY id DESC")
+    cursor.execute("SELECT id, timestamp, query, trust_gate_status, audit_data_json FROM audit_logs ORDER BY id DESC")
     rows = cursor.fetchall()
     conn.close()
-    
+
     logs = []
     for row in rows:
         try:
             data = json.loads(row["audit_data_json"])
-            risk_level = "Unknown"
+            # risk_level comes from the deterministic trust_gate_status SQLite
+            # column (mathematically computed by Trust Gate), not Gemini's
+            # narrative final_audit_summary — the two could otherwise disagree.
+            risk_level = row["trust_gate_status"] or "Unknown"
             score = "N/A"
             if "final_audit_summary" in data:
-                risk_level = data["final_audit_summary"].get("overall_trust_status", "Unknown")
                 score = data["final_audit_summary"].get("compliance_score_summary", "N/A")
-                
+
             logs.append({
                 "id": row["id"],
                 "timestamp": row["timestamp"],

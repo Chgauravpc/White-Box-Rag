@@ -52,13 +52,15 @@ async def verify_rag_response(request: RAGResponse):
     conflicts = [] 
     gate = compute_trust_gate(verifications, conflicts)
     
-    # 3. Scorecard
+    # 3. Scorecard — no retrieval step in this sandbox, so context_relevance/
+    # context_utilization/context_diversity stay at their zero defaults (frontend
+    # shows "N/A (sandbox mode)" for those specific metrics).
     scorecard = generate_scorecard(
-        query="Mocked Query", 
-        response=request.answer, 
-        verifications=verifications, 
+        query="",
+        response=request.answer,
+        verifications=verifications,
         conflicts=conflicts,
-        claims=request.claims
+        claims=request.claims,
     )
     
     return VerificationCompleteResponse(

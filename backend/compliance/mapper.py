@@ -14,15 +14,15 @@ except ImportError:
     logger.warning("BP1's hybrid_retrieve not found. Using fallback mock.")
     def hybrid_retrieve(query: str, top_k: int = 5, filters=None):
         class MockChunk:
-            publication_name = "Mock_FSR"
+            publication_name = "Mock_Collection"
             edition_date = "2024-06"
             section_id = "1.1"
-            chunk_text = "Data localization and KYC guidelines must be strictly adhered to as per RBI mandate."
+            chunk_text = "Placeholder source text — the real hybrid retriever was unavailable."
         return [MockChunk()]
 
 async def map_requirement(req: BRDRequirement) -> Dict[str, Any]:
     """
-    Evaluates a single BRDRequirement against relevant RBI sections 
+    Evaluates a single BRDRequirement against relevant knowledge base sections
     with timeout and retry logic.
     """
     logger.info(f"Mapping requirement: {req.text}")
@@ -42,17 +42,17 @@ async def map_requirement(req: BRDRequirement) -> Dict[str, Any]:
             formatted_sections += f"{chunk}\n\n"
         
     if not formatted_sections.strip():
-        formatted_sections = "No relevant RBI sections found for this requirement."
+        formatted_sections = "No relevant knowledge base sections found for this requirement."
 
     # 2. Build Prompt
     prompt = f"""
-You are a senior RBI regulatory compliance expert.
-Your task is to evaluate how well a Business Requirement aligns with RBI guidelines based ONLY on the provided RBI sections.
+You are a senior compliance/requirements analyst.
+Your task is to evaluate how well a requirement aligns with the ingested knowledge base, based ONLY on the provided sources.
 
 ---
 ### INPUT:
-BRD Requirement: {req.text}
-Relevant RBI Sections: {formatted_sections}
+Requirement: {req.text}
+Relevant Knowledge Base Sources: {formatted_sections}
 ---
 ### OUTPUT FORMAT (STRICT JSON ONLY):
 {{

@@ -1,5 +1,5 @@
 """
-PDF Parser — Extracts section-level chunks from RBI publication PDFs.
+PDF Parser — Extracts section-level chunks from PDF documents.
 
 Pipeline:  PDF → page extraction → section detection → overlapping chunking → ChromaDB storage
 """
@@ -17,7 +17,7 @@ from shared.models import ChunkMetadata
 logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────
-#  Regex patterns for RBI section headers
+#  Regex patterns for structured (financial-report-style) section headers
 # ──────────────────────────────────────────────
 
 # Matches:  1.1 Overview,  2.3.1 Credit Risk,  3.12 Capital Adequacy
@@ -41,6 +41,39 @@ ROMAN_NUMBERED_SECTION = re.compile(
 BOX_SECTION = re.compile(
     r"^(Box\s+\d+\.\d+)[:\s]*(.*)", re.MULTILINE
 )
+
+# ──────────────────────────────────────────────
+#  Generic (domain-agnostic) fallback patterns
+#
+#  Only tried when NONE of the structured patterns above find a single
+#  section anywhere in the document — so they never interfere with
+#  financial-report-style PDFs that already parse correctly. They exist so
+#  that other reasonably-structured document types (contracts, specs,
+#  single-level-numbered documents) still get section-level attribution
+#  instead of silently degrading to page-level citation.
+# ──────────────────────────────────────────────
+
+# Matches:  1. Definitions,  2 Term and Termination
+GENERIC_NUMBERED_SECTION = re.compile(
+    r"^(\d+)\.?\s+([A-Z][\w\s\-:,&/()]{2,70})$"
+)
+
+
+def _looks_like_generic_heading(line: str) -> bool:
+    """Heuristic: a short, standalone Title-Case or ALL-CAPS line that reads
+    like a heading rather than a sentence of body prose. Intentionally
+    conservative — this is a best-effort fallback, not a layout analyzer.
+    """
+    if not line or len(line) > 80:
+        return False
+    if line[-1] in ".,;:":
+        return False
+    words = line.split()
+    if not (1 <= len(words) <= 10):
+        return False
+    if line.isupper():
+        return True
+    return all(w[0].isupper() for w in words if w[:1].isalpha())
 
 
 # ──────────────────────────────────────────────
@@ -74,17 +107,87 @@ def extract_pages(filepath: str) -> list[dict]:
 #  Step 2: Detect section boundaries
 # ──────────────────────────────────────────────
 
-def detect_sections(pages: list[dict]) -> list[dict]:
+def detect_sections(pages: list[dict]) -> tuple[list[dict], bool]:
     """Identify section boundaries across all pages.
 
+    Tries the structured (financial-report-style) patterns first. If those
+    find nothing at all, falls back to a generic domain-agnostic pass before
+    finally falling back to page-level pseudo-sections.
+
     Returns:
-        List of {
+        (sections, structured) where structured is False only when neither
+        pattern tier found anything and every page became its own section.
+        sections: List of {
             "section_id": str,
             "section_title": str,
             "text": str,          # accumulated text for this section
             "start_page": int,
         }
     """
+    sections = _detect_structured_sections(pages)
+    if sections:
+        return sections, True
+
+    sections = _detect_generic_sections(pages)
+    if sections:
+        logger.info(f"No financial-report-style headers found — used generic fallback, {len(sections)} sections")
+        return sections, True
+
+    # Final fallback: if NO sections detected by either tier, treat each page as its own section
+    logger.warning("No section headers detected — treating each page as its own section")
+    for page in pages:
+        if page["text"]:
+            sections.append({
+                "section_id":    f"UNSTRUCTURED-p{page['page_number']}",
+                "section_title": f"Page {page['page_number']} (unstructured)",
+                "text":          page["text"],
+                "start_page":    page["page_number"],
+            })
+    return sections, False
+
+
+def _detect_generic_sections(pages: list[dict]) -> list[dict]:
+    """Domain-agnostic fallback: single-level numbered headers and short
+    Title-Case/ALL-CAPS heading lines. Best-effort — see `_looks_like_generic_heading`.
+    """
+    sections = []
+    current_section = None
+
+    for page in pages:
+        text = page["text"]
+        page_num = page["page_number"]
+        if not text:
+            continue
+
+        for line in text.split("\n"):
+            line_stripped = line.strip()
+            if not line_stripped:
+                continue
+
+            m = GENERIC_NUMBERED_SECTION.match(line_stripped)
+            is_heading = bool(m) or _looks_like_generic_heading(line_stripped)
+
+            if is_heading:
+                if current_section is not None:
+                    sections.append(current_section)
+                section_id = m.group(1) if m else str(len(sections) + 1)
+                title = m.group(2).strip() if m else line_stripped
+                current_section = {
+                    "section_id":    section_id,
+                    "section_title": title,
+                    "text":          "",
+                    "start_page":    page_num,
+                }
+            elif current_section is not None:
+                current_section["text"] += line_stripped + "\n"
+
+    if current_section is not None:
+        sections.append(current_section)
+    return sections
+
+
+def _detect_structured_sections(pages: list[dict]) -> list[dict]:
+    """Financial-report-style section detection (numbered, roman, box headers)."""
     sections = []
     current_section = None
 
@@ -191,19 +294,7 @@ def detect_sections(pages: list[dict]) -> list[dict]:
     if current_section is not None:
         sections.append(current_section)
 
-    # Fallback: if NO sections detected, treat each page as its own section
-    if not sections:
-        logger.warning("No section headers detected — treating each page as its own section")
-        for page in pages:
-            if page["text"]:
-                sections.append({
-                    "section_id":    f"UNSTRUCTURED-p{page['page_number']}",
-                    "section_title": f"Page {page['page_number']} (unstructured)",
-                    "text":          page["text"],
-                    "start_page":    page["page_number"],
-                })
-
-    logger.info(f"Detected {len(sections)} sections")
+    logger.info(f"Structured-pattern pass detected {len(sections)} sections")
     return sections
 
 
@@ -280,8 +371,8 @@ def ingest_pdf(filepath: str, publication: str, edition_date: str) -> int:
 
     Args:
         filepath: Path to the PDF file.
-        publication: Publication code (FSR, MPR, PSR, FER).
-        edition_date: Edition identifier, e.g. "June 2024".
+        publication: Collection label (free-text, e.g. "FSR", "CONTRACTS").
+        edition_date: Version/date identifier, e.g. "June 2024".
 
     Returns:
         Number of chunks ingested.
@@ -290,7 +381,7 @@ def ingest_pdf(filepath: str, publication: str, edition_date: str) -> int:
     pages = extract_pages(filepath)
 
     # 2. Detect sections
-    sections = detect_sections(pages)
+    sections, structured = detect_sections(pages)
 
     # 3. Chunk all sections
     all_chunks: list[ChunkMetadata] = []
@@ -327,10 +418,10 @@ def ingest_pdf(filepath: str, publication: str, edition_date: str) -> int:
 
     # 5. Record in SQLite
     filename = os.path.basename(filepath)
-    insert_document(filename, publication, edition_date, len(all_chunks))
+    insert_document(filename, publication, edition_date, len(all_chunks), structured=structured)
 
     logger.info(
         f"Ingested {len(all_chunks)} chunks from {filename} "
-        f"({publication} · {edition_date}, {len(sections)} sections)"
+        f"({publication} · {edition_date}, {len(sections)} sections, structured={structured})"
     )
     return len(all_chunks)
