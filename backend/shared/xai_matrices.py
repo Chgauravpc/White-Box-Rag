@@ -128,6 +128,42 @@ def build_attribution_matrix(answer_sentences, chunks):
     chunk_norm = chunk_emb / np.linalg.norm(chunk_emb, axis=1, keepdims=True)
     return sent_norm @ chunk_norm.T
 
+def compute_answer_relevancy(query, answer):
+    """cosine(encode(query), encode(answer)) — simplified pure-math proxy for
+    RAGAS's Answer Relevancy metric (which uses LLM-generated pseudo-questions;
+    out of scope here since we don't use an LLM as judge)."""
+    if not query or not answer:
+        return 0.0
+    q_emb = _encoder.encode([query])
+    a_emb = _encoder.encode([answer])
+    q_norm = q_emb / np.linalg.norm(q_emb, axis=1, keepdims=True)
+    a_norm = a_emb / np.linalg.norm(a_emb, axis=1, keepdims=True)
+    return float((q_norm @ a_norm.T).squeeze())
+
+
+def compute_context_utilization(primary_attributions, chunk_ids):
+    """Fraction of retrieved chunks actually cited as the primary source of >=1 claim."""
+    if not chunk_ids:
+        return 0.0
+    cited = {a["primary_chunk_id"] for a in primary_attributions if a.get("primary_chunk_id")}
+    return round(len(cited) / len(chunk_ids), 6)
+
+
+def compute_context_diversity(chunks):
+    """1 - mean pairwise cosine similarity of retrieved chunk embeddings.
+    Flags retrieval that returned several near-duplicate chunks (wasted context)."""
+    if not chunks or len(chunks) < 2:
+        return 1.0
+    emb = _encoder.encode([c["chunk_text"] for c in chunks])
+    norm = emb / np.linalg.norm(emb, axis=1, keepdims=True)
+    sim_matrix = norm @ norm.T
+    iu = np.triu_indices(len(chunks), k=1)
+    if len(iu[0]) == 0:
+        return 1.0
+    mean_pairwise = float(sim_matrix[iu].mean())
+    return round(max(0.0, 1.0 - mean_pairwise), 6)
+
+
 def attribute_sentence(A_row, chunks):
     top_j     = int(A_row.argmax())
     max_score = float(A_row[top_j])

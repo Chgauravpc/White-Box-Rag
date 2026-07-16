@@ -21,14 +21,14 @@ EMBEDDING_MODEL    = "all-MiniLM-L6-v2"
 
 
 def get_chroma_collection():
-    """Return the rbi_sections ChromaDB collection (lazy singleton)."""
+    """Return the document_sections ChromaDB collection (lazy singleton)."""
     global _chroma_client, _chroma_collection
     if _chroma_collection is None:
         os.makedirs(CHROMA_PATH, exist_ok=True)
         _chroma_client     = chromadb.PersistentClient(path=CHROMA_PATH)
         embedding_fn       = SentenceTransformerEmbeddingFunction(model_name=EMBEDDING_MODEL)
         _chroma_collection = _chroma_client.get_or_create_collection(
-            name="rbi_sections",
+            name="document_sections",
             embedding_function=embedding_fn,
             metadata={"hnsw:space": "cosine"},
         )
@@ -45,7 +45,8 @@ def _init_sqlite_tables(conn):
             publication_name TEXT NOT NULL,
             edition_date     TEXT NOT NULL,
             chunk_count      INTEGER DEFAULT 0,
-            ingested_at      TEXT NOT NULL
+            ingested_at      TEXT NOT NULL,
+            structured       INTEGER DEFAULT 1
         );
 
         CREATE TABLE IF NOT EXISTS audit_logs (
@@ -69,6 +70,26 @@ def _init_sqlite_tables(conn):
             authoritative TEXT NOT NULL,
             cached_at    TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS eval_runs (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_label     TEXT NOT NULL,
+            dataset_path  TEXT NOT NULL,
+            started_at    TEXT NOT NULL,
+            finished_at   TEXT,
+            num_queries   INTEGER,
+            metrics_json  TEXT,
+            per_query_json TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS brd_validation_runs (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp      TEXT NOT NULL,
+            source_filename TEXT,
+            requirements_json TEXT NOT NULL,
+            results_json   TEXT NOT NULL,
+            overall_score  REAL
+        );
     """)
     conn.commit()
 
@@ -84,12 +105,12 @@ def get_sqlite_connection():
 
 # ── SQLite Helper Functions ─────────────────────────────────
 
-def insert_document(filename, publication_name, edition_date, chunk_count):
+def insert_document(filename, publication_name, edition_date, chunk_count, structured: bool = True):
     conn = get_sqlite_connection()
     try:
         cursor = conn.execute(
-            "INSERT INTO documents (filename, publication_name, edition_date, chunk_count, ingested_at) VALUES (?, ?, ?, ?, ?)",
-            (filename, publication_name, edition_date, chunk_count, datetime.now().isoformat()),
+            "INSERT INTO documents (filename, publication_name, edition_date, chunk_count, ingested_at, structured) VALUES (?, ?, ?, ?, ?, ?)",
+            (filename, publication_name, edition_date, chunk_count, datetime.now().isoformat(), int(structured)),
         )
         conn.commit()
         return cursor.lastrowid
@@ -169,6 +190,79 @@ def list_audit_logs():
 
 def get_sqlite_conn():
     return get_sqlite_connection()
+
+
+# ── Eval Run Helpers ─────────────────────────────────────────
+
+def insert_eval_run(run_label, dataset_path, started_at, finished_at, num_queries, metrics_json, per_query_json):
+    conn = get_sqlite_connection()
+    try:
+        cursor = conn.execute(
+            "INSERT INTO eval_runs (run_label, dataset_path, started_at, finished_at, num_queries, metrics_json, per_query_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (run_label, dataset_path, started_at, finished_at, num_queries, metrics_json, per_query_json),
+        )
+        conn.commit()
+        return cursor.lastrowid
+    finally:
+        conn.close()
+
+
+def list_eval_runs():
+    conn = get_sqlite_connection()
+    try:
+        rows = conn.execute(
+            "SELECT id, run_label, dataset_path, started_at, finished_at, num_queries, metrics_json "
+            "FROM eval_runs ORDER BY id DESC"
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def get_eval_run(run_id: int):
+    conn = get_sqlite_connection()
+    try:
+        row = conn.execute("SELECT * FROM eval_runs WHERE id = ?", (run_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+# ── BRD Validation Run Helpers (server-side history, not localStorage) ──────
+
+def insert_brd_validation_run(source_filename, requirements_json, results_json, overall_score):
+    conn = get_sqlite_connection()
+    try:
+        cursor = conn.execute(
+            "INSERT INTO brd_validation_runs (timestamp, source_filename, requirements_json, results_json, overall_score) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (datetime.now().isoformat(), source_filename, requirements_json, results_json, overall_score),
+        )
+        conn.commit()
+        return cursor.lastrowid
+    finally:
+        conn.close()
+
+
+def list_brd_validation_runs():
+    conn = get_sqlite_connection()
+    try:
+        rows = conn.execute(
+            "SELECT id, timestamp, source_filename, overall_score FROM brd_validation_runs ORDER BY id DESC"
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def get_brd_validation_run(run_id: int):
+    conn = get_sqlite_connection()
+    try:
+        row = conn.execute("SELECT * FROM brd_validation_runs WHERE id = ?", (run_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
 
 
 # ── Query Embedding Storage (for related-query cosine lookup) ─

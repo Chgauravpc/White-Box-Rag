@@ -50,10 +50,10 @@ class RiskLevel(str, Enum):
 # ──────────────────────────────────────────────
 
 class ChunkMetadata(BaseModel):
-    """A single chunk of text from an RBI publication with full provenance."""
+    """A single chunk of text from an ingested document with full provenance."""
     model_config = ConfigDict(from_attributes=True)
 
-    publication_name: str = Field(..., description="Publication code: FSR, MPR, PSR, or FER")
+    publication_name: str = Field(..., description="Free-text collection/document label")
     edition_date: str = Field(..., description="Edition date, e.g. 'June 2024'")
     section_id: str = Field(..., description="Section identifier, e.g. '1.1', '2.3.1'")
     section_title: str = Field(default="", description="Section heading text")
@@ -70,6 +70,8 @@ class Claim(BaseModel):
     source_passage: str = Field(default="", description="Full source chunk — for human reading")
     focused_passage: str = Field(default="", description="Top-K sentences fed to NLI — for audit")
     confidence: float = Field(default=1.0, ge=0.0, le=1.0, description="Confidence score (BP2 overwrites)")
+    retained: bool = Field(default=True, description="False if stripped from the mitigated/filtered answer")
+    filter_reason: str = Field(default="", description="Why this claim was stripped or flagged, e.g. 'contradiction', 'low_confidence', 'flagged:neutral'")
 
 
 class RAGResponse(BaseModel):
@@ -79,13 +81,19 @@ class RAGResponse(BaseModel):
 
 
 class DocumentInfo(BaseModel):
-    """Metadata about an ingested document."""
+    """Metadata about an ingested document.
+
+    `publication_name`/`edition_date` are domain-agnostic despite the naming —
+    they're a free-text "collection name" / "version label" pair, not tied to
+    any specific document domain.
+    """
     id: int = Field(..., description="Database row ID")
     filename: str
     publication_name: str
     edition_date: str
     chunk_count: int = Field(default=0)
     ingested_at: str = Field(default="")
+    structured: bool = Field(default=True, description="False if section detection fell back to page-level citation")
 
 
 class SectionInfo(BaseModel):
@@ -128,12 +136,15 @@ class TrustGate(BaseModel):
 
 
 class TrustScorecard(BaseModel):
-    """RAGAS-style scorecard with 5 trust metrics."""
-    context_relevance: float = Field(default=0.0, ge=0.0, le=1.0)
-    faithfulness: float = Field(default=0.0, ge=0.0, le=1.0)
-    citation_precision: float = Field(default=0.0, ge=0.0, le=1.0)
+    """RAGAS-style scorecard of pure-math trust/quality metrics (no LLM-as-judge)."""
+    context_relevance: float = Field(default=0.0, ge=0.0, le=1.0, description="Mean cosine(query, retrieved chunk)")
+    faithfulness: float = Field(default=0.0, ge=0.0, le=1.0, description="Alias for faithfulness_post on AuditReport")
+    citation_precision: float = Field(default=0.0, ge=0.0, le=1.0, description="Fraction of claims with a real source citation")
     edition_conflict_risk: bool = Field(default=False)
-    paraphrase_stability: float = Field(default=0.0, ge=0.0, le=1.0)
+    paraphrase_stability: float = Field(default=1.0, ge=0.0, le=1.0, description="NLI claim-agreement with a second sample; 1.0 (skipped) when the primary answer is already Safe")
+    answer_relevancy: float = Field(default=0.0, ge=0.0, le=1.0, description="cosine(query, answer) — simplified proxy, not RAGAS's LLM-based metric")
+    context_utilization: float = Field(default=0.0, ge=0.0, le=1.0, description="Fraction of retrieved chunks actually cited by >=1 claim")
+    context_diversity: float = Field(default=0.0, ge=0.0, le=1.0, description="1 - mean pairwise cosine of retrieved chunk embeddings")
 
 
 # ──────────────────────────────────────────────
@@ -145,7 +156,7 @@ class BRDRequirement(BaseModel):
     id: str = Field(..., description="Requirement ID, e.g. REQ-001")
     text: str = Field(..., description="Requirement text")
     category: str = Field(default="", description="e.g. 'payment processing', 'KYC'")
-    regulatory_relevance: str = Field(default="", description="RBI domain: FSR/MPR/PSR/FER")
+    regulatory_relevance: str = Field(default="", description="Relevant domain/category of the requirement")
     mapped_sections: list[str] = Field(default_factory=list)
     alignment_score: float = Field(default=0.0, ge=0.0, le=1.0)
     gaps: list[str] = Field(default_factory=list)
@@ -160,7 +171,7 @@ class RetrievalMatrix(BaseModel):
 
 class EntailmentMatrix(BaseModel):
     claim_texts:   list[str] = Field(description="length m")
-    passage_ids:   list[str] = Field(description="section IDs only, e.g. FSR-§I.2.1")
+    passage_ids:   list[str] = Field(description="section IDs only, e.g. COLLECTION-§I.2.1")
     passage_texts: list[str] = Field(default_factory=list, description="raw passage text for audit display")
     scores:        list[list[list[float]]] = Field(description="shape (m, n, 3) — E[i][j] = [contradiction, entailment, neutral] probs")
     labels:        list[str] = Field(default=["contradiction", "entailment", "neutral"])
@@ -208,7 +219,7 @@ class AuditReport(BaseModel):
     id: Optional[int] = None
     timestamp: str = Field(default_factory=lambda: datetime.now().isoformat())
     query: str = Field(default="")
-    response: str = Field(default="")
+    response: str = Field(default="", description="Raw, unfiltered Gemini answer — preserved for traceability")
     claims: list[Claim] = Field(default_factory=list)
     verifications: list[VerificationResult] = Field(default_factory=list)
     trust_gate: Optional[TrustGate] = None
@@ -217,6 +228,18 @@ class AuditReport(BaseModel):
     xai_artifacts: Optional[XAIArtifacts] = None
     related_queries: List[RelatedQuery] = Field(default_factory=list,
         description="Past queries with high cosine similarity to this query")
+    # Hallucination mitigation (claim-level filtering + abstention)
+    filtered_claims: list[str] = Field(default_factory=list,
+        description="Retained (grounded) claim texts — the 'Verified statements' view, not a reconstructed narrative")
+    faithfulness_raw: float = Field(default=0.0, ge=0.0, le=1.0, description="entailed/total over ALL claims")
+    faithfulness_post: float = Field(default=0.0, ge=0.0, le=1.0, description="entailed/total over RETAINED claims only")
+    retained_trust_score: float = Field(default=0.0, ge=0.0, le=1.0, description="Trust Gate score recomputed over retained claims only")
+    abstained: bool = Field(default=False)
+    abstention_reason: str = Field(default="")
+    scorecard: Optional[TrustScorecard] = None
+    # Observability (latency & Gemini call cost)
+    latency_ms: Dict[str, float] = Field(default_factory=dict, description="Per-stage wall-clock time")
+    gemini_call_count: int = Field(default=0)
 
 
 # ──────────────────────────────────────────────

@@ -21,6 +21,16 @@ def compute_trust_gate(
     if primary_attributions is None:
         primary_attributions = []
 
+    # No claims, no conflicts, nothing to attribute — this is "nothing to
+    # verify," not "everything verified." Guard it explicitly rather than
+    # falling through to SAFE with a misleading "all claims supported" message.
+    if not verifications and not conflicts and not primary_attributions:
+        return TrustGate(
+            status=TrustStatus.SAFE,
+            reasoning="No claims were extracted to verify.",
+            overall_score=1.0,
+        )
+
     overall_score        = 1.0
     reasons              = []
     has_weak_attribution = False

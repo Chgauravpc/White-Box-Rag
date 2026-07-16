@@ -1,6 +1,7 @@
 # Virtual environment
 venv/
 .venv/
+.venv-streamlit/
 env/
 
 # Python cache
@@ -14,15 +15,10 @@ __pycache__/
 .env
 
 # Data directories — large files, not in source control
+# Covers ChromaDB persistence (data/chromadb/) and uploaded PDFs (data/documents/)
 data/
 *.db
 *.sqlite3
-
-# ChromaDB persistence
-data/chromadb/
-
-# Uploaded PDFs (too large for git)
-data/rbi_reports/
 
 # Test cache
 .pytest_cache/
@@ -43,13 +39,10 @@ Thumbs.db
 dist/
 build/
 
-# Tests — exclude test files and test artefacts from source control
-backend/tests/
-backend/conftest.py
-backend/test_*.py
-**/test_*.py
+# Test artefacts (the suite itself under backend/tests/ IS tracked)
 htmlcov/
 .coverage
+
 # Frontend & Root Node Modules
 node_modules/
 frontend/
