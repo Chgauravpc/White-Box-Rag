@@ -22,6 +22,9 @@ from verification.routes import router as verification_router
 # Offline Evaluation Harness
 from eval.routes import router as eval_router
 
+# Governance — Human-in-the-loop review
+from governance.routes import router as governance_router
+
 # ──────────────────────────────────────────────
 #  Logging
 # ──────────────────────────────────────────────
@@ -59,6 +62,7 @@ app.include_router(compliance_router, prefix="/api")
 
 app.include_router(verification_router, prefix="/api")
 app.include_router(eval_router, prefix="/api")
+app.include_router(governance_router, prefix="/api")
 
 
 # ──────────────────────────────────────────────

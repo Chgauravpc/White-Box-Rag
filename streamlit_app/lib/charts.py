@@ -88,10 +88,11 @@ def score_gauge(value_pct: float, title: str = "Compliance Score") -> go.Figure:
         gauge={
             "axis": {"range": [0, 100]},
             "bar": {"color": color},
+            # rgba (not 8-digit hex) — plotly gauge steps reject #rrggbbaa.
             "steps": [
-                {"range": [0, 50], "color": "#ef444422"},
-                {"range": [50, 70], "color": "#f59e0b22"},
-                {"range": [70, 100], "color": "#10b98122"},
+                {"range": [0, 50], "color": "rgba(239,68,68,0.13)"},
+                {"range": [50, 70], "color": "rgba(245,158,11,0.13)"},
+                {"range": [70, 100], "color": "rgba(16,185,129,0.13)"},
             ],
         },
     ))

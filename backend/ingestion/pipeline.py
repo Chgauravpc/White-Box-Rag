@@ -6,6 +6,7 @@ both from the HTTP route and directly (no HTTP round-trip) by the offline
 evaluation harness (backend/eval/harness.py).
 """
 
+import asyncio
 import logging
 import time
 
@@ -26,6 +27,7 @@ from ingestion.retriever import hybrid_retrieve
 from verification.nli_engine import verify_all_claims
 from verification.trust_gate import compute_trust_gate
 from verification.mitigation import filter_claims, should_abstain, ABSTENTION_MESSAGE_TEMPLATE
+from verification.counterfactual import compute_counterfactuals
 from verification.scorecard import generate_scorecard
 from verification.stability import compute_paraphrase_stability
 from verification.edition_conflict import discover_and_check_conflicts
@@ -41,10 +43,16 @@ from shared.xai_matrices import (
     compute_context_utilization,
     compute_context_diversity,
 )
-from shared.database import store_query_embedding, get_past_query_embeddings
+from shared.database import store_query_embedding, get_past_query_embeddings, finalize_audit_record
 from shared.models import NLIVerdict
 
 logger = logging.getLogger(__name__)
+
+# Serializes the audit-chain finalize step. The backend is a single uvicorn
+# process, and the eval harness fans out /query under asyncio.Semaphore(3);
+# without this lock two concurrent finalizes could read the same predecessor
+# and fork the hash chain.
+_chain_lock = asyncio.Lock()
 
 
 def _faithfulness(verifications: list) -> float:
@@ -138,6 +146,9 @@ async def run_query_pipeline(query: str, filters: dict | None = None) -> AuditRe
         [v.model_dump() for v in verifications],
         prim_attrs,
     )
+
+    # Counterfactuals: per-claim "what would change the verdict" (pure math).
+    counterfactuals = compute_counterfactuals(verifications, prim_attrs, conflicts, trust_gate)
 
     retrieval_mat = RetrievalMatrix(
         chunk_ids=chunk_ids,
@@ -271,7 +282,17 @@ async def run_query_pipeline(query: str, filters: dict | None = None) -> AuditRe
     audit_report_dict["abstained"] = abstained
     audit_report_dict["abstention_reason"] = abstention_reason
     audit_report_dict["scorecard"] = scorecard.model_dump()
+    audit_report_dict["counterfactuals"] = counterfactuals
     audit_report_dict["latency_ms"] = latency_ms
     audit_report_dict["gemini_call_count"] = gemini_call_count
+
+    # ── Step 8: Tamper-evident finalization ──
+    # Overwrite the partial row written by generate_audit_report with the COMPLETE
+    # record and stamp its hash-chain link. Serialized so the chain can't fork.
+    if log_id:
+        async with _chain_lock:
+            prev_hash, record_hash, _ = finalize_audit_record(log_id, audit_report_dict)
+        audit_report_dict["prev_hash"] = prev_hash
+        audit_report_dict["record_hash"] = record_hash
 
     return AuditReport(**audit_report_dict)

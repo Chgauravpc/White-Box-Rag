@@ -1,3 +1,3 @@
-{"id": "q001", "query": "What is discussed in the ingested documents?", "expected_section_ids": [], "notes": "generic smoke-test question — faithfulness/abstention tracking only, no retrieval ground truth"}
-{"id": "q002", "query": "Summarize the key points of the first ingested document.", "expected_section_ids": [], "notes": "generic smoke-test question"}
-{"id": "q003", "query": "What is the capital of a country that has never been mentioned in any ingested document?", "expected_section_ids": [], "notes": "deliberately off-topic — should trigger abstention or a low-faithfulness answer"}
+{"id": "q001", "query": "What is discussed in the ingested documents?", "expected_section_ids": [], "expected_abstain": false, "notes": "generic smoke-test question — faithfulness/abstention tracking only, no retrieval ground truth"}
+{"id": "q002", "query": "Summarize the key points of the first ingested document.", "expected_section_ids": [], "expected_abstain": false, "notes": "generic smoke-test question"}
+{"id": "q003", "query": "What is the capital of a country that has never been mentioned in any ingested document?", "expected_section_ids": [], "expected_abstain": true, "notes": "deliberately off-topic — should trigger abstention or a low-faithfulness answer"}

@@ -15,6 +15,7 @@ from typing import List
 
 from shared.models import Claim, VerificationResult, TrustGate, NLIVerdict, TrustStatus
 from verification.trust_gate import compute_trust_gate
+from verification.conformal import load_active_threshold
 
 # Mirrors trust_gate.py's own thresholds — a claim is only STRIPPED when it
 # fails a genuine NLI-grounded signal (contradiction or low entailment).
@@ -120,10 +121,16 @@ def should_abstain(
     if retained_gate.status == TrustStatus.NON_COMPLIANT:
         return True, f"Remaining claims still fail trust gating: {retained_gate.reasoning}", retained_gate.overall_score
 
-    if mean_penalty > ABSTENTION_MEAN_PENALTY_CEIL:
+    # Prefer the conformally-calibrated threshold when one exists; otherwise fall
+    # back to the fixed ceiling (identical behaviour to before calibration).
+    ceil = load_active_threshold()
+    if ceil is None:
+        ceil = ABSTENTION_MEAN_PENALTY_CEIL
+    if mean_penalty > ceil:
+        ceil_str = "∞" if ceil == float("inf") else f"{ceil:.2f}"
         return True, (
             f"Aggregate risk across remaining claims is too high "
-            f"(mean penalty {mean_penalty:.2f} > {ABSTENTION_MEAN_PENALTY_CEIL})."
+            f"(mean penalty {mean_penalty:.2f} > {ceil_str})."
         ), retained_gate.overall_score
 
     return False, "", retained_gate.overall_score
