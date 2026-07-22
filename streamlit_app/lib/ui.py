@@ -80,6 +80,24 @@ def kpi_card(label: str, value: str, color: str | None = None, help_text: str | 
     st.metric(label, value, help=help_text)
 
 
+def integrity_chip_html(intact: bool, detail: str = "") -> str:
+    """Pill for tamper-evident audit-chain status (reuses the trust-badge look)."""
+    color = TRUST_COLORS["Safe"] if intact else TRUST_COLORS["Non_Compliant"]
+    icon = "🔒" if intact else "⛓️‍💥"
+    label = "Chain Verified" if intact else "Chain Broken"
+    suffix = f" &middot; {detail}" if detail else ""
+    return (
+        f'<span style="display:inline-flex;align-items:center;gap:6px;'
+        f'background:{color}22;color:{color};border:1px solid {color}55;'
+        f'border-radius:999px;padding:4px 12px;font-weight:600;font-size:0.9rem;">'
+        f'{icon} {label}{suffix}</span>'
+    )
+
+
+def integrity_chip(intact: bool, detail: str = "") -> None:
+    st.markdown(integrity_chip_html(intact, detail), unsafe_allow_html=True)
+
+
 def render_global_css() -> None:
     st.markdown(
         """

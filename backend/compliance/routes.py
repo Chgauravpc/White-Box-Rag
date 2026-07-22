@@ -11,7 +11,8 @@ from compliance.brd_parser import parse_brd
 from compliance.mapper import map_requirement
 from compliance.audit import get_all_logs, get_audit_by_id
 from shared.models import BRDRequirement
-from shared.database import insert_brd_validation_run, list_brd_validation_runs, get_brd_validation_run
+from shared.database import insert_brd_validation_run, list_brd_validation_runs, get_brd_validation_run, iter_audit_chain
+from shared.audit_chain import verify_chain
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +155,17 @@ async def list_audit_logs():
     except Exception as e:
         logger.error(f"Error getting audit logs: {e}")
         return JSONResponse(status_code=500, content={"status": "error", "message": "Failed to retrieve audit logs"})
+
+# NOTE: must precede "/audit/{id}" so "verify-integrity" isn't parsed as an int id.
+@router.get("/audit/verify-integrity")
+async def verify_audit_integrity():
+    """Walk the audit hash-chain and report whether it is intact (tamper-evident check)."""
+    try:
+        result = verify_chain(iter_audit_chain())
+        return {"status": "success", "data": result}
+    except Exception as e:
+        logger.error(f"Error verifying audit chain: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "message": "Failed to verify audit chain"})
 
 @router.get("/audit/{id}")
 async def get_audit_report(id: int):

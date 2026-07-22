@@ -144,6 +144,11 @@ def download_audit(audit_id: int) -> bytes:
     return _request("GET", f"/audit/{audit_id}/download")
 
 
+def verify_audit_integrity() -> dict:
+    """Tamper-evident check: walk the audit hash-chain and report if it's intact."""
+    return _request("GET", "/audit/verify-integrity")
+
+
 # ── Evaluation Harness ────────────────────────────────────────────────────
 
 def run_eval(dataset_path: Optional[str] = None, run_label: str = "") -> dict:

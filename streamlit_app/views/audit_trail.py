@@ -5,7 +5,16 @@ import streamlit as st
 from lib import api_client
 from lib.api_client import ApiError
 from lib.charts import scorecard_radar
-from lib.ui import trust_badge, render_claim_card
+from lib.ui import trust_badge, render_claim_card, integrity_chip
+
+
+def _chain_status():
+    """Return the tamper-evident chain result, or None if unavailable."""
+    try:
+        return api_client.verify_audit_integrity().get("data")
+    except ApiError:
+        return None
+
 
 st.title("🗂️ Audit Trail")
 
@@ -34,6 +43,14 @@ if audit_id:
         with c1:
             trust_badge(trust_gate.get("status", "Unknown"), trust_gate.get("overall_score"))
             st.caption(report.get("timestamp", ""))
+            chain = _chain_status()
+            if chain is not None:
+                broken_here = (
+                    not chain.get("intact", True)
+                    and (chain.get("first_break") or {}).get("id") == report.get("id")
+                )
+                detail = "this record was altered" if broken_here else ""
+                integrity_chip(chain.get("intact", True) and not broken_here, detail)
         with c2:
             st.download_button(
                 "⬇ Download Audit (JSON)",
@@ -103,6 +120,14 @@ else:
     c2.metric("Safe", safe_n)
     c3.metric("Under Review", review_n)
     c4.metric("Non-Compliant", noncompliant_n)
+
+    chain = _chain_status()
+    if chain is not None:
+        detail = f"{chain.get('count', 0)} records"
+        if not chain.get("intact", True):
+            fb = chain.get("first_break") or {}
+            detail = f"break at record #{fb.get('id')} ({fb.get('reason')})"
+        integrity_chip(chain.get("intact", True), detail)
 
     search = st.text_input("🔍 Search by query text or ID")
 

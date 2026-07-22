@@ -240,6 +240,9 @@ class AuditReport(BaseModel):
     # Observability (latency & Gemini call cost)
     latency_ms: Dict[str, float] = Field(default_factory=dict, description="Per-stage wall-clock time")
     gemini_call_count: int = Field(default=0)
+    # Tamper-evident audit chain (Feature 1) — SHA-256 link to the prior record
+    prev_hash: Optional[str] = Field(default=None, description="record_hash of the preceding audit in the chain")
+    record_hash: Optional[str] = Field(default=None, description="SHA-256 of this record chained on prev_hash")
 
 
 # ──────────────────────────────────────────────

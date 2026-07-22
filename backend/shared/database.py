@@ -12,6 +12,7 @@ import chromadb
 from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 
 from shared.config import CHROMA_PATH, SQLITE_PATH
+from shared.audit_chain import compute_record_hash, next_link
 
 
 # ── ChromaDB ──────────────────────────────────────────────
@@ -36,6 +37,18 @@ def get_chroma_collection():
 
 
 # ── SQLite ─────────────────────────────────────────────────
+
+def _ensure_column(conn, table: str, column: str, decl: str):
+    """Idempotently add a column to an existing table.
+
+    The schema is created with CREATE TABLE IF NOT EXISTS, which never alters a
+    table that already exists — so new columns on pre-existing databases need an
+    explicit ALTER. Guarded by PRAGMA table_info so it is safe to call every time.
+    """
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
 
 def _init_sqlite_tables(conn):
     conn.executescript("""
@@ -91,6 +104,14 @@ def _init_sqlite_tables(conn):
             overall_score  REAL
         );
     """)
+
+    # Tamper-evident audit chain columns (added via ALTER so existing DBs upgrade).
+    # chain_index defines the hash-chain order independently of row id, so
+    # concurrent/out-of-order finalization can't fork the chain.
+    _ensure_column(conn, "audit_logs", "prev_hash", "TEXT")
+    _ensure_column(conn, "audit_logs", "record_hash", "TEXT")
+    _ensure_column(conn, "audit_logs", "chain_index", "INTEGER")
+
     conn.commit()
 
 
@@ -276,6 +297,62 @@ def store_query_embedding(log_id, embedding):
             (json.dumps(embedding), log_id),
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+# ── Tamper-evident audit chain ──────────────────────────────
+
+def finalize_audit_record(log_id: int, full_record: dict) -> tuple[str, str, int]:
+    """Chain-link and persist the COMPLETE audit record.
+
+    The initial INSERT (in compliance/audit.py) stores only a partial report
+    before the pipeline appends scorecard/XAI/faithfulness. This overwrites
+    audit_data_json with the full record and stamps its hash-chain link.
+
+    Caller MUST hold the pipeline chain lock — this does read-last-then-update,
+    which is only race-free when serialized. `chain_index` (not row id) defines
+    chain order, so out-of-order finalization can't fork the chain.
+    Returns (prev_hash, record_hash, chain_index).
+    """
+    conn = get_sqlite_connection()
+    try:
+        row = conn.execute(
+            "SELECT record_hash, chain_index FROM audit_logs "
+            "WHERE chain_index IS NOT NULL ORDER BY chain_index DESC LIMIT 1"
+        ).fetchone()
+        prev_row = {"record_hash": row["record_hash"], "chain_index": row["chain_index"]} if row else None
+        prev_hash, chain_index = next_link(prev_row)
+        record_hash = compute_record_hash(full_record, prev_hash)
+
+        stored = dict(full_record)
+        stored["prev_hash"] = prev_hash
+        stored["record_hash"] = record_hash
+        conn.execute(
+            "UPDATE audit_logs SET audit_data_json=?, prev_hash=?, record_hash=?, chain_index=? WHERE id=?",
+            (json.dumps(stored, default=str), prev_hash, record_hash, chain_index, log_id),
+        )
+        conn.commit()
+        return prev_hash, record_hash, chain_index
+    finally:
+        conn.close()
+
+
+def iter_audit_chain() -> list:
+    """Return all finalized audit rows in chain order for integrity verification."""
+    conn = get_sqlite_connection()
+    try:
+        rows = conn.execute(
+            "SELECT id, chain_index, prev_hash, record_hash, audit_data_json "
+            "FROM audit_logs WHERE chain_index IS NOT NULL ORDER BY chain_index ASC"
+        ).fetchall()
+        return [{
+            "id":          r["id"],
+            "chain_index": r["chain_index"],
+            "prev_hash":   r["prev_hash"],
+            "record_hash": r["record_hash"],
+            "record_json": r["audit_data_json"],
+        } for r in rows]
     finally:
         conn.close()
 
