@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from compliance.brd_parser import parse_brd
 from compliance.mapper import map_requirement
 from compliance.audit import get_all_logs, get_audit_by_id
+from compliance.frameworks import get_frameworks
 from shared.models import BRDRequirement
 from shared.database import insert_brd_validation_run, list_brd_validation_runs, get_brd_validation_run, iter_audit_chain
 from shared.audit_chain import verify_chain
@@ -147,6 +148,16 @@ async def get_sample_brd():
     except Exception as e:
         logger.error(f"Error fetching sample BRD: {e}")
         return JSONResponse(status_code=500, content={"status": "error", "message": "Failed to get sample", "details": str(e)})
+
+@router.get("/compliance/frameworks")
+async def compliance_frameworks():
+    """Static mapping of system capabilities to EU AI Act / NIST AI RMF controls, with coverage."""
+    try:
+        return {"status": "success", "data": get_frameworks()}
+    except Exception as e:
+        logger.error(f"Error building framework mapping: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "message": "Failed to build framework mapping"})
+
 
 @router.get("/audit/logs")
 async def list_audit_logs():

@@ -164,6 +164,12 @@ def get_review_history(audit_id: int) -> dict:
     return _request("GET", f"/review/{audit_id}/history")
 
 
+# ── Governance: Regulatory framework mapping ──────────────────────────────
+
+def get_frameworks() -> dict:
+    return _request("GET", "/compliance/frameworks")
+
+
 # ── Evaluation Harness ────────────────────────────────────────────────────
 
 def run_eval(dataset_path: Optional[str] = None, run_label: str = "") -> dict:

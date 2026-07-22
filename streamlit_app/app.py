@@ -28,13 +28,14 @@ brd_page = st.Page("views/brd_validator.py", title="BRD Validator", icon="📋")
 ingest_page = st.Page("views/ingest.py", title="Ingest Documents", icon="📥")
 audit_page = st.Page("views/audit_trail.py", title="Audit Trail", icon="🗂️")
 review_page = st.Page("views/review_queue.py", title="Review Queue", icon="🧑‍⚖️")
+mapping_page = st.Page("views/regulatory_mapping.py", title="Regulatory Mapping", icon="⚖️")
 eval_page = st.Page("views/evaluation.py", title="Evaluation", icon="📈")
 
 nav = st.navigation({
     "Overview": [dashboard, query_page],
     "Verification": [verify_page, brd_page],
     "System": [ingest_page, audit_page],
-    "Governance": [review_page],
+    "Governance": [review_page, mapping_page],
     "Evaluation": [eval_page],
 })
 
