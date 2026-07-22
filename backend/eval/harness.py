@@ -55,11 +55,18 @@ async def _run_one(item: dict, semaphore: asyncio.Semaphore) -> dict:
         )
         claims_total = len(report.claims)
         claims_stripped = sum(1 for c in report.claims if not c.retained)
+        # Nonconformity score for conformal calibration: retained-set mean penalty
+        # (= what should_abstain compares against the threshold), reconstructed here
+        # from the report so should_abstain's signature stays unchanged.
+        n_retained = claims_total - claims_stripped
+        mean_penalty = round((1.0 - report.retained_trust_score) / max(1, n_retained), 6)
 
         return {
             "id": item.get("id"),
             "query": item.get("query"),
             "expected_section_ids": item.get("expected_section_ids", []),
+            "expected_abstain": item.get("expected_abstain", False),
+            "mean_penalty": mean_penalty,
             "retrieved_chunk_ids": retrieved_chunk_ids,
             "faithfulness_raw": report.faithfulness_raw,
             "faithfulness_post": report.faithfulness_post,
@@ -183,4 +190,38 @@ async def run_eval(dataset_path: str, run_label: str = "") -> dict:
         "num_queries": len(items),
         "metrics": metrics,
         "per_query": per_query_results,
+    }
+
+
+async def run_calibration(dataset_path: str, alpha: float = 0.1, run_label: str = "") -> dict:
+    """Run a labelled dataset through the live pipeline and conformally calibrate
+    the abstention threshold from the *answerable* items' mean-penalty scores.
+
+    Requires a live GEMINI_API_KEY + ingested corpus (executes the full pipeline).
+    Persists the active calibration so should_abstain picks it up immediately.
+    """
+    from verification.conformal import calibrate_threshold, save_calibration
+
+    items = _load_dataset(dataset_path)
+    semaphore = asyncio.Semaphore(EVAL_CONCURRENCY)
+    results = list(await asyncio.gather(*[_run_one(item, semaphore) for item in items]))
+
+    answerable = [r for r in results if not r.get("error") and not r.get("expected_abstain", False)]
+    scores = [r["mean_penalty"] for r in answerable if r.get("mean_penalty") is not None]
+
+    calibration = calibrate_threshold(scores, alpha)
+    calibration.update({
+        "dataset_path": dataset_path,
+        "run_label": run_label,
+        "created_at": datetime.utcnow().isoformat(),
+    })
+    save_calibration(calibration)
+
+    return {
+        "calibration": calibration,
+        "num_items": len(items),
+        "num_answerable": len(answerable),
+        "num_errors": sum(1 for r in results if r.get("error")),
+        "scores": sorted(scores),
+        "per_query": results,
     }

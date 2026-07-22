@@ -177,3 +177,12 @@ def list_eval_runs() -> list:
 
 def get_eval_run(run_id: int) -> dict:
     return _request("GET", f"/eval/runs/{run_id}")
+
+
+def calibrate_conformal(alpha: float = 0.1, dataset_path: Optional[str] = None, run_label: str = "") -> dict:
+    payload = {"alpha": alpha, "dataset_path": dataset_path, "run_label": run_label}
+    return _request("POST", "/eval/calibrate", timeout=LONG_TIMEOUT, json=payload)
+
+
+def get_active_calibration() -> dict:
+    return _request("GET", "/eval/calibration")
