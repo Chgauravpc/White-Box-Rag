@@ -39,10 +39,13 @@ Query
 [BP2 · Verification & Trust] NLI claim verification → faithfulness score → Shapley trust gate
   │
   ▼
-[BP3 · Compliance & Audit]   BRD-to-corpus mapping, gap/violation analysis → SQLite audit report
+[BP3 · Compliance & Audit]   BRD-to-corpus mapping, gap/violation analysis → hash-chained SQLite audit report
   │
   ▼
-[Eval Harness]               offline RAGAS-style faithfulness / retrieval metrics
+[Governance]                 counterfactuals, conformal abstention, HITL review queue, framework mapping
+  │
+  ▼
+[Eval Harness]               offline RAGAS-style faithfulness / retrieval metrics + conformal calibration
 ```
 
 ### Trust Gate (deterministic)
@@ -62,6 +65,20 @@ Status = NON_COMPLIANT       if any contradiction / low-entailment / unresolved 
 ```
 
 Every gate decision can be fully reconstructed from the individual claim verdicts — no hidden state.
+
+---
+
+## Governance Suite
+
+On top of the trust layer, five features make the system defensible to an auditor or regulator — all pure-math, no LLM in the decision loop. Full details: [`docs/GOVERNANCE.md`](docs/GOVERNANCE.md).
+
+| Feature | What it adds | Pillar |
+|---|---|---|
+| **Tamper-evident audit log** | Every audit record is SHA-256 hash-chained to its predecessor; any edit/deletion/reorder is detectable via `GET /api/audit/verify-integrity`. | Governance |
+| **Human-in-the-loop review queue** | The `NEEDS_HUMAN_REVIEW` verdict routes to a real workflow with reviewer identity and an append-only, chained resolution history. | Responsible |
+| **Counterfactual explanations** | For a non-SAFE answer, shows *what would change the verdict* — which claim, if removed, most improves the trust outcome (exact leave-one-out gate recomputation). | Explainability |
+| **Conformal abstention** | Replaces the hand-tuned abstention ceiling with a split-conformal threshold calibrated to a statistical risk target α. | Responsible |
+| **Regulatory mapping** | Static mapping of capabilities to **EU AI Act** and **NIST AI RMF** controls, with honest coverage. | Governance |
 
 ---
 
@@ -94,14 +111,21 @@ White Box RAG/
 │   │   ├── edition_conflict.py    # cross-edition conflict detection
 │   │   ├── trust_gate.py          # Shapley-style trust gate
 │   │   ├── stability.py
-│   │   └── mitigation.py
+│   │   ├── mitigation.py          # claim filtering + abstention
+│   │   ├── counterfactual.py      # "what would change the verdict" (Governance)
+│   │   └── conformal.py           # split-conformal abstention calibration (Governance)
 │   ├── compliance/                # BP3: BRD mapping, gap analysis, audit
 │   │   ├── brd_parser.py
 │   │   ├── mapper.py              # requirement → corpus alignment scoring
-│   │   └── audit.py               # JSON audit report → SQLite
-│   ├── eval/                      # offline evaluation harness
+│   │   ├── audit.py               # JSON audit report → SQLite
+│   │   └── frameworks.py          # EU AI Act / NIST AI RMF control catalog (Governance)
+│   ├── governance/                # HITL review queue router (Governance)
+│   ├── eval/                      # offline evaluation harness + conformal calibration
 │   └── shared/                    # config, DB, Gemini client, XAI matrices, models
-├── streamlit_app/                 # Streamlit UI (ingest, query, verify, compliance, audit, eval)
+│       └── audit_chain.py         # tamper-evident hash-chain primitives (Governance)
+├── streamlit_app/                 # Streamlit UI (ingest, query, verify, compliance,
+│                                  #   audit, review queue, regulatory mapping, eval)
+├── docs/GOVERNANCE.md             # governance suite documentation
 ├── xai_math_spec.md               # full mathematical specification
 └── requirements.txt
 ```
@@ -155,8 +179,9 @@ All routes are mounted under `/api`:
 |-----------|---------|
 | **Ingestion** | Upload/parse documents, chunk, embed, and query with hybrid retrieval |
 | **Verification** | Verify claims, score faithfulness, run the trust gate |
-| **Compliance** | Map requirements to the corpus, produce gap/violation analysis and audit reports |
-| **Eval** | Run the offline evaluation harness |
+| **Compliance** | Map requirements to the corpus, produce gap/violation analysis and audit reports; `GET /api/audit/verify-integrity` (chain check), `GET /api/compliance/frameworks` (regulatory mapping) |
+| **Governance** | HITL review of flagged audits: `GET /api/review/queue`, `POST /api/review/{id}/resolve`, `GET /api/review/{id}/history` |
+| **Eval** | Run the offline harness; `POST /api/eval/calibrate` + `GET /api/eval/calibration` (conformal abstention) |
 
 See the interactive OpenAPI docs at `/docs` for full request/response schemas.
 
@@ -179,8 +204,12 @@ pytest
 | Hallucination detection | ✅ NLI entailment per claim | ❌ None |
 | Trust score | ✅ Deterministic, reconstructible | ❌ None |
 | Verification layer | ✅ Pure math, no LLM | — |
-| Audit trail | ✅ Full JSON → SQLite | ❌ None |
+| Audit trail | ✅ Full JSON → SQLite, **SHA-256 hash-chained** | ❌ None |
 | Compliance gating | ✅ SAFE / REVIEW / NON-COMPLIANT | ❌ None |
+| Human oversight | ✅ HITL review queue w/ chained resolutions | ❌ None |
+| Counterfactual explanations | ✅ "What would change the verdict" | ❌ None |
+| Abstention threshold | ✅ Conformal-calibrated (risk target α) | ❌ None |
+| Regulatory alignment | ✅ EU AI Act / NIST AI RMF mapping | ❌ None |
 
 ---
 
