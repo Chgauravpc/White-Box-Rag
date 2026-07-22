@@ -101,6 +101,50 @@ if audit_id:
             for c in edition_conflicts:
                 st.caption(f"{c.get('conflict_description')} — superseding: {c.get('superseding_edition')}")
 
+        # ── Human-in-the-loop review ──
+        st.divider()
+        st.markdown("#### 🧑‍⚖️ Human Review")
+        try:
+            hist_resp = api_client.get_review_history(int(report["id"]))
+            history = hist_resp.get("data", [])
+            review_status = hist_resp.get("review_status", "Pending")
+        except ApiError as e:
+            history, review_status = [], None
+            st.caption(f"Could not load review history: {e}")
+
+        if review_status is not None:
+            _rs_color = {"Approved": "#10b981", "Overridden": "#f59e0b",
+                         "Rejected": "#ef4444", "Pending": "#6b7280"}.get(review_status, "#6b7280")
+            st.markdown(
+                f'<span style="color:{_rs_color};font-weight:600;">Current status: {review_status}</span>',
+                unsafe_allow_html=True,
+            )
+
+        if history:
+            for h in history:
+                st.caption(
+                    f"• **{h.get('action')}** by *{h.get('reviewer')}* — {h.get('timestamp', '')[:19]}"
+                    + (f" — {h.get('note')}" if h.get("note") else "")
+                )
+
+        with st.form(key=f"resolve_{report['id']}", clear_on_submit=True):
+            st.markdown("**Record a resolution**")
+            rc1, rc2 = st.columns([1, 1])
+            reviewer = rc1.text_input("Reviewer", placeholder="your name / id")
+            action = rc2.selectbox("Action", ["approve", "override", "reject"])
+            note = st.text_area("Note (optional)", height=70)
+            submitted = st.form_submit_button("Submit resolution")
+            if submitted:
+                if not reviewer.strip():
+                    st.warning("Reviewer is required.")
+                else:
+                    try:
+                        api_client.resolve_review(int(report["id"]), reviewer.strip(), action, note)
+                        st.toast(f"Recorded: {action} by {reviewer.strip()}")
+                        st.rerun()
+                    except ApiError as e:
+                        st.error(f"Could not record resolution: {e}")
+
 else:
     try:
         logs = api_client.list_audit_logs()

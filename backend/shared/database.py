@@ -103,6 +103,18 @@ def _init_sqlite_tables(conn):
             results_json   TEXT NOT NULL,
             overall_score  REAL
         );
+
+        CREATE TABLE IF NOT EXISTS review_actions (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            audit_log_id  INTEGER NOT NULL,
+            reviewer      TEXT NOT NULL,
+            action        TEXT NOT NULL,
+            note          TEXT,
+            timestamp     TEXT NOT NULL,
+            chain_index   INTEGER NOT NULL,
+            prev_hash     TEXT NOT NULL,
+            record_hash   TEXT NOT NULL
+        );
     """)
 
     # Tamper-evident audit chain columns (added via ALTER so existing DBs upgrade).
@@ -352,6 +364,112 @@ def iter_audit_chain() -> list:
             "prev_hash":   r["prev_hash"],
             "record_hash": r["record_hash"],
             "record_json": r["audit_data_json"],
+        } for r in rows]
+    finally:
+        conn.close()
+
+
+# ── Human-in-the-loop review actions (own tamper-evident chain) ─────────────
+
+def insert_review_action(audit_log_id: int, reviewer: str, action: str, note: str = "") -> dict:
+    """Append a hash-chained review action. Caller MUST hold the review chain lock.
+
+    review_actions form their own chain (independent of the audit chain), so the
+    resolution history is as tamper-evident as the audits it resolves. Append-only:
+    the audit_logs row is never mutated (that would break its own chain).
+    """
+    conn = get_sqlite_connection()
+    try:
+        row = conn.execute(
+            "SELECT record_hash, chain_index FROM review_actions "
+            "WHERE chain_index IS NOT NULL ORDER BY chain_index DESC LIMIT 1"
+        ).fetchone()
+        prev_row = {"record_hash": row["record_hash"], "chain_index": row["chain_index"]} if row else None
+        prev_hash, chain_index = next_link(prev_row)
+        ts = datetime.now().isoformat()
+        payload = {
+            "audit_log_id": audit_log_id, "reviewer": reviewer,
+            "action": action, "note": note, "timestamp": ts,
+        }
+        record_hash = compute_record_hash(payload, prev_hash)
+        cur = conn.execute(
+            "INSERT INTO review_actions (audit_log_id, reviewer, action, note, timestamp, chain_index, prev_hash, record_hash) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (audit_log_id, reviewer, action, note, ts, chain_index, prev_hash, record_hash),
+        )
+        conn.commit()
+        return {
+            "id": cur.lastrowid, "audit_log_id": audit_log_id, "reviewer": reviewer,
+            "action": action, "note": note, "timestamp": ts,
+            "chain_index": chain_index, "prev_hash": prev_hash, "record_hash": record_hash,
+        }
+    finally:
+        conn.close()
+
+
+def list_review_actions(audit_log_id: int) -> list:
+    """All review actions for one audit, in chain order (oldest first)."""
+    conn = get_sqlite_connection()
+    try:
+        rows = conn.execute(
+            "SELECT id, audit_log_id, reviewer, action, note, timestamp, chain_index, prev_hash, record_hash "
+            "FROM review_actions WHERE audit_log_id = ? ORDER BY chain_index ASC",
+            (audit_log_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def latest_review_status(audit_log_id: int) -> str:
+    """Derived current review status (the latest action's status), or Pending if none."""
+    from shared.models import ReviewStatus, ACTION_TO_STATUS
+    conn = get_sqlite_connection()
+    try:
+        row = conn.execute(
+            "SELECT action FROM review_actions WHERE audit_log_id = ? ORDER BY chain_index DESC LIMIT 1",
+            (audit_log_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return ReviewStatus.PENDING.value
+    return ACTION_TO_STATUS.get(row["action"], ReviewStatus.PENDING).value
+
+
+def list_pending_reviews() -> list:
+    """Audits flagged Needs_Human_Review that have no resolution yet."""
+    conn = get_sqlite_connection()
+    try:
+        rows = conn.execute(
+            "SELECT a.id, a.timestamp, a.query, a.trust_gate_status "
+            "FROM audit_logs a "
+            "WHERE a.trust_gate_status = 'Needs_Human_Review' "
+            "AND NOT EXISTS (SELECT 1 FROM review_actions r WHERE r.audit_log_id = a.id) "
+            "ORDER BY a.id DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def iter_review_chain() -> list:
+    """All review actions in global chain order, shaped for audit_chain.verify_chain."""
+    conn = get_sqlite_connection()
+    try:
+        rows = conn.execute(
+            "SELECT id, audit_log_id, reviewer, action, note, timestamp, chain_index, prev_hash, record_hash "
+            "FROM review_actions WHERE chain_index IS NOT NULL ORDER BY chain_index ASC"
+        ).fetchall()
+        return [{
+            "id": r["id"],
+            "chain_index": r["chain_index"],
+            "prev_hash": r["prev_hash"],
+            "record_hash": r["record_hash"],
+            "record": {
+                "audit_log_id": r["audit_log_id"], "reviewer": r["reviewer"],
+                "action": r["action"], "note": r["note"], "timestamp": r["timestamp"],
+            },
         } for r in rows]
     finally:
         conn.close()

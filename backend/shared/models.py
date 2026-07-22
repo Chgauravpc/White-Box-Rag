@@ -45,6 +45,22 @@ class RiskLevel(str, Enum):
     LOW = "LOW"
 
 
+class ReviewStatus(str, Enum):
+    """Human-in-the-loop resolution state for an audit flagged Needs_Human_Review."""
+    PENDING = "Pending"
+    APPROVED = "Approved"
+    OVERRIDDEN = "Overridden"
+    REJECTED = "Rejected"
+
+
+# Reviewer-supplied action verb → resulting ReviewStatus (the set of valid actions).
+ACTION_TO_STATUS = {
+    "approve": ReviewStatus.APPROVED,
+    "override": ReviewStatus.OVERRIDDEN,
+    "reject": ReviewStatus.REJECTED,
+}
+
+
 # ──────────────────────────────────────────────
 #  BP1: Ingestion & RAG Models
 # ──────────────────────────────────────────────
@@ -253,3 +269,26 @@ class QueryRequest(BaseModel):
     """Request body for the /api/query endpoint."""
     query: str = Field(..., min_length=1, description="The user's question")
     filters: Optional[dict] = Field(default=None, description="Optional filters: publication_name, edition_date")
+
+
+# ──────────────────────────────────────────────
+#  Governance: Human-in-the-loop Review
+# ──────────────────────────────────────────────
+
+class ReviewAction(BaseModel):
+    """A single human resolution appended to the tamper-evident review chain."""
+    id: Optional[int] = None
+    audit_log_id: int
+    reviewer: str = Field(..., description="Reviewer identity (supplied in the request — no auth in this system)")
+    action: str = Field(..., description="approve | override | reject")
+    note: str = Field(default="")
+    timestamp: str = Field(default="")
+    prev_hash: Optional[str] = None
+    record_hash: Optional[str] = None
+
+
+class ResolveReviewRequest(BaseModel):
+    """Request body for POST /api/review/{audit_id}/resolve."""
+    reviewer: str = Field(..., min_length=1)
+    action: str = Field(..., description="approve | override | reject")
+    note: str = Field(default="")

@@ -149,6 +149,21 @@ def verify_audit_integrity() -> dict:
     return _request("GET", "/audit/verify-integrity")
 
 
+# ── Governance: Human-in-the-loop review ──────────────────────────────────
+
+def list_review_queue() -> dict:
+    return _request("GET", "/review/queue")
+
+
+def resolve_review(audit_id: int, reviewer: str, action: str, note: str = "") -> dict:
+    payload = {"reviewer": reviewer, "action": action, "note": note}
+    return _request("POST", f"/review/{audit_id}/resolve", json=payload)
+
+
+def get_review_history(audit_id: int) -> dict:
+    return _request("GET", f"/review/{audit_id}/history")
+
+
 # ── Evaluation Harness ────────────────────────────────────────────────────
 
 def run_eval(dataset_path: Optional[str] = None, run_label: str = "") -> dict:
