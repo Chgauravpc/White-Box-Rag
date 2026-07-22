@@ -5,7 +5,7 @@ import streamlit as st
 from lib import api_client
 from lib.api_client import ApiError
 from lib.charts import scorecard_radar
-from lib.ui import trust_badge, render_claim_card, integrity_chip
+from lib.ui import trust_badge, render_claim_card, integrity_chip, render_counterfactuals
 
 
 def _chain_status():
@@ -80,6 +80,8 @@ if audit_id:
                     matching = [v for v in report.get("verifications", []) if v.get("claim_text") == c.get("text")]
                     if matching:
                         st.write(matching[0].get("explanation", ""))
+
+            render_counterfactuals(report.get("counterfactuals", []))
 
         with right:
             st.markdown("#### Trust Score Matrix")

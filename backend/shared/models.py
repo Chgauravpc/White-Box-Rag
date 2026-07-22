@@ -221,6 +221,17 @@ class XAIArtifacts(BaseModel):
     shapley: ShapleyContributions
 
 
+class Counterfactual(BaseModel):
+    """Contrastive explanation: the trust outcome if one claim were removed."""
+    claim_text: str
+    phi: float = Field(description="This claim's Shapley penalty contribution")
+    penalty_reasons: list[str] = Field(default_factory=list)
+    score_if_removed: float = Field(ge=0.0, le=1.0)
+    status_if_removed: str
+    flips_status: bool = Field(default=False, description="True if removal changes the trust status band")
+    primary_driver: bool = Field(default=False, description="The single highest-leverage claim")
+
+
 class RelatedQuery(BaseModel):
     """A past query semantically similar to the current query."""
     id: int
@@ -253,6 +264,8 @@ class AuditReport(BaseModel):
     abstained: bool = Field(default=False)
     abstention_reason: str = Field(default="")
     scorecard: Optional[TrustScorecard] = None
+    # Counterfactual "what would change the verdict" explanations (Feature 4)
+    counterfactuals: list[Counterfactual] = Field(default_factory=list)
     # Observability (latency & Gemini call cost)
     latency_ms: Dict[str, float] = Field(default_factory=dict, description="Per-stage wall-clock time")
     gemini_call_count: int = Field(default=0)

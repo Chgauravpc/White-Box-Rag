@@ -110,6 +110,27 @@ def render_global_css() -> None:
     )
 
 
+def render_counterfactuals(cfs: list[dict]) -> None:
+    """Render 'what would change the verdict' cards from AuditReport.counterfactuals."""
+    if not cfs:
+        return
+    st.markdown("#### 🔀 What would change the verdict")
+    st.caption("If a flagged claim were removed, the trust outcome would change as shown. ⭐ marks the highest-leverage claim.")
+    for cf in cfs:
+        star = "⭐ " if cf.get("primary_driver") else ""
+        flip = f' → <b>{cf.get("status_if_removed")}</b>' if cf.get("flips_status") else ""
+        reasons = ", ".join(cf.get("penalty_reasons", []))
+        reasons_txt = f" &middot; {reasons}" if reasons else ""
+        st.markdown(
+            f'<div style="border-left:3px solid #f59e0b;padding:6px 10px;margin:6px 0;background:#f59e0b11;">'
+            f'{star}{(cf.get("claim_text") or "")[:150]}<br/>'
+            f'<span style="font-size:0.8rem;color:#6b7280;">contribution &minus;{cf.get("phi", 0):.2f} '
+            f'&middot; if removed: score {cf.get("score_if_removed", 0) * 100:.0f}%{flip}{reasons_txt}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+
 def render_claim_card(claim: dict) -> None:
     """Render a single claim with its retained/stripped state and citation."""
     retained = claim.get("retained", True)

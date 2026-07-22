@@ -8,7 +8,7 @@ import streamlit as st
 from lib import api_client
 from lib.api_client import ApiError
 from lib.charts import scorecard_radar
-from lib.ui import trust_badge, render_claim_card, score_pill
+from lib.ui import trust_badge, render_claim_card, score_pill, render_counterfactuals
 
 st.title("💬 RAG Query")
 st.caption("Ask a question. The answer is filtered to grounded statements only — see 'Show raw answer' for the unfiltered version.")
@@ -82,6 +82,8 @@ if run and query.strip():
                     st.markdown("---")
                     for c in claims:
                         render_claim_card(c)
+
+                render_counterfactuals(report.get("counterfactuals", []))
 
                 st.caption(f"⏱️ {sum(latency.values()):.0f}ms total · {gemini_calls} Gemini call(s)")
 

@@ -27,6 +27,7 @@ from ingestion.retriever import hybrid_retrieve
 from verification.nli_engine import verify_all_claims
 from verification.trust_gate import compute_trust_gate
 from verification.mitigation import filter_claims, should_abstain, ABSTENTION_MESSAGE_TEMPLATE
+from verification.counterfactual import compute_counterfactuals
 from verification.scorecard import generate_scorecard
 from verification.stability import compute_paraphrase_stability
 from verification.edition_conflict import discover_and_check_conflicts
@@ -145,6 +146,9 @@ async def run_query_pipeline(query: str, filters: dict | None = None) -> AuditRe
         [v.model_dump() for v in verifications],
         prim_attrs,
     )
+
+    # Counterfactuals: per-claim "what would change the verdict" (pure math).
+    counterfactuals = compute_counterfactuals(verifications, prim_attrs, conflicts, trust_gate)
 
     retrieval_mat = RetrievalMatrix(
         chunk_ids=chunk_ids,
@@ -278,6 +282,7 @@ async def run_query_pipeline(query: str, filters: dict | None = None) -> AuditRe
     audit_report_dict["abstained"] = abstained
     audit_report_dict["abstention_reason"] = abstention_reason
     audit_report_dict["scorecard"] = scorecard.model_dump()
+    audit_report_dict["counterfactuals"] = counterfactuals
     audit_report_dict["latency_ms"] = latency_ms
     audit_report_dict["gemini_call_count"] = gemini_call_count
 
