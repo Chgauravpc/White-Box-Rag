@@ -1,0 +1,8 @@
+{"id": "cal-a1", "query": "What are the main topics covered in the ingested documents?", "expected_section_ids": [], "expected_abstain": false, "notes": "answerable — broad summary a populated corpus can answer"}
+{"id": "cal-a2", "query": "Summarize the key obligations described in the ingested documents.", "expected_section_ids": [], "expected_abstain": false, "notes": "answerable — grounded summary"}
+{"id": "cal-a3", "query": "What definitions or key terms are established in the ingested documents?", "expected_section_ids": [], "expected_abstain": false, "notes": "answerable — most documents define terms"}
+{"id": "cal-a4", "query": "What conditions or requirements are stated in the ingested documents?", "expected_section_ids": [], "expected_abstain": false, "notes": "answerable — grounded conditions"}
+{"id": "cal-a5", "query": "What are the stated purposes or objectives in the ingested documents?", "expected_section_ids": [], "expected_abstain": false, "notes": "answerable — grounded objectives"}
+{"id": "cal-u1", "query": "What is the current stock price of a company never mentioned in the documents?", "expected_section_ids": [], "expected_abstain": true, "notes": "unanswerable — out of corpus"}
+{"id": "cal-u2", "query": "Who won a sporting event that is unrelated to the ingested documents?", "expected_section_ids": [], "expected_abstain": true, "notes": "unanswerable — out of corpus"}
+{"id": "cal-u3", "query": "What is the capital of a country that appears nowhere in the ingested documents?", "expected_section_ids": [], "expected_abstain": true, "notes": "unanswerable — out of corpus"}

@@ -45,6 +45,22 @@ class RiskLevel(str, Enum):
     LOW = "LOW"
 
 
+class ReviewStatus(str, Enum):
+    """Human-in-the-loop resolution state for an audit flagged Needs_Human_Review."""
+    PENDING = "Pending"
+    APPROVED = "Approved"
+    OVERRIDDEN = "Overridden"
+    REJECTED = "Rejected"
+
+
+# Reviewer-supplied action verb → resulting ReviewStatus (the set of valid actions).
+ACTION_TO_STATUS = {
+    "approve": ReviewStatus.APPROVED,
+    "override": ReviewStatus.OVERRIDDEN,
+    "reject": ReviewStatus.REJECTED,
+}
+
+
 # ──────────────────────────────────────────────
 #  BP1: Ingestion & RAG Models
 # ──────────────────────────────────────────────
@@ -205,6 +221,17 @@ class XAIArtifacts(BaseModel):
     shapley: ShapleyContributions
 
 
+class Counterfactual(BaseModel):
+    """Contrastive explanation: the trust outcome if one claim were removed."""
+    claim_text: str
+    phi: float = Field(description="This claim's Shapley penalty contribution")
+    penalty_reasons: list[str] = Field(default_factory=list)
+    score_if_removed: float = Field(ge=0.0, le=1.0)
+    status_if_removed: str
+    flips_status: bool = Field(default=False, description="True if removal changes the trust status band")
+    primary_driver: bool = Field(default=False, description="The single highest-leverage claim")
+
+
 class RelatedQuery(BaseModel):
     """A past query semantically similar to the current query."""
     id: int
@@ -237,9 +264,14 @@ class AuditReport(BaseModel):
     abstained: bool = Field(default=False)
     abstention_reason: str = Field(default="")
     scorecard: Optional[TrustScorecard] = None
+    # Counterfactual "what would change the verdict" explanations (Feature 4)
+    counterfactuals: list[Counterfactual] = Field(default_factory=list)
     # Observability (latency & Gemini call cost)
     latency_ms: Dict[str, float] = Field(default_factory=dict, description="Per-stage wall-clock time")
     gemini_call_count: int = Field(default=0)
+    # Tamper-evident audit chain (Feature 1) — SHA-256 link to the prior record
+    prev_hash: Optional[str] = Field(default=None, description="record_hash of the preceding audit in the chain")
+    record_hash: Optional[str] = Field(default=None, description="SHA-256 of this record chained on prev_hash")
 
 
 # ──────────────────────────────────────────────
@@ -250,3 +282,26 @@ class QueryRequest(BaseModel):
     """Request body for the /api/query endpoint."""
     query: str = Field(..., min_length=1, description="The user's question")
     filters: Optional[dict] = Field(default=None, description="Optional filters: publication_name, edition_date")
+
+
+# ──────────────────────────────────────────────
+#  Governance: Human-in-the-loop Review
+# ──────────────────────────────────────────────
+
+class ReviewAction(BaseModel):
+    """A single human resolution appended to the tamper-evident review chain."""
+    id: Optional[int] = None
+    audit_log_id: int
+    reviewer: str = Field(..., description="Reviewer identity (supplied in the request — no auth in this system)")
+    action: str = Field(..., description="approve | override | reject")
+    note: str = Field(default="")
+    timestamp: str = Field(default="")
+    prev_hash: Optional[str] = None
+    record_hash: Optional[str] = None
+
+
+class ResolveReviewRequest(BaseModel):
+    """Request body for POST /api/review/{audit_id}/resolve."""
+    reviewer: str = Field(..., min_length=1)
+    action: str = Field(..., description="approve | override | reject")
+    note: str = Field(default="")

@@ -80,6 +80,24 @@ def kpi_card(label: str, value: str, color: str | None = None, help_text: str | 
     st.metric(label, value, help=help_text)
 
 
+def integrity_chip_html(intact: bool, detail: str = "") -> str:
+    """Pill for tamper-evident audit-chain status (reuses the trust-badge look)."""
+    color = TRUST_COLORS["Safe"] if intact else TRUST_COLORS["Non_Compliant"]
+    icon = "🔒" if intact else "⛓️‍💥"
+    label = "Chain Verified" if intact else "Chain Broken"
+    suffix = f" &middot; {detail}" if detail else ""
+    return (
+        f'<span style="display:inline-flex;align-items:center;gap:6px;'
+        f'background:{color}22;color:{color};border:1px solid {color}55;'
+        f'border-radius:999px;padding:4px 12px;font-weight:600;font-size:0.9rem;">'
+        f'{icon} {label}{suffix}</span>'
+    )
+
+
+def integrity_chip(intact: bool, detail: str = "") -> None:
+    st.markdown(integrity_chip_html(intact, detail), unsafe_allow_html=True)
+
+
 def render_global_css() -> None:
     st.markdown(
         """
@@ -90,6 +108,27 @@ def render_global_css() -> None:
         """,
         unsafe_allow_html=True,
     )
+
+
+def render_counterfactuals(cfs: list[dict]) -> None:
+    """Render 'what would change the verdict' cards from AuditReport.counterfactuals."""
+    if not cfs:
+        return
+    st.markdown("#### 🔀 What would change the verdict")
+    st.caption("If a flagged claim were removed, the trust outcome would change as shown. ⭐ marks the highest-leverage claim.")
+    for cf in cfs:
+        star = "⭐ " if cf.get("primary_driver") else ""
+        flip = f' → <b>{cf.get("status_if_removed")}</b>' if cf.get("flips_status") else ""
+        reasons = ", ".join(cf.get("penalty_reasons", []))
+        reasons_txt = f" &middot; {reasons}" if reasons else ""
+        st.markdown(
+            f'<div style="border-left:3px solid #f59e0b;padding:6px 10px;margin:6px 0;background:#f59e0b11;">'
+            f'{star}{(cf.get("claim_text") or "")[:150]}<br/>'
+            f'<span style="font-size:0.8rem;color:#6b7280;">contribution &minus;{cf.get("phi", 0):.2f} '
+            f'&middot; if removed: score {cf.get("score_if_removed", 0) * 100:.0f}%{flip}{reasons_txt}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
 
 
 def render_claim_card(claim: dict) -> None:

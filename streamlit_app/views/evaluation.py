@@ -29,6 +29,44 @@ with col2:
 
 st.divider()
 
+# ── Conformal abstention calibration ──
+st.markdown("#### 🎯 Conformal Abstention Calibration")
+st.caption(
+    "Replace the hand-tuned abstention ceiling with a threshold calibrated to a statistical "
+    "risk target (split conformal). Calibrating at α means at most ~α of truly-answerable "
+    "queries are wrongly abstained. Runs the live pipeline over the labelled calibration set."
+)
+
+try:
+    active = api_client.get_active_calibration()
+except ApiError as e:
+    active = None
+    st.error(f"Could not load calibration status: {e}")
+
+cc1, cc2 = st.columns([2, 1])
+with cc1:
+    if active and active.get("active"):
+        cal = active["calibration"]
+        st.success(
+            f"**Active threshold: {cal.get('threshold')}** "
+            f"(α={cal.get('alpha')}, n={cal.get('n')})  \n{cal.get('coverage_note', '')}"
+        )
+    elif active is not None:
+        st.info(active.get("message", "No calibration set — abstention uses the fixed ceiling (0.25)."))
+with cc2:
+    alpha = st.slider("α (max wrongful-abstention rate)", 0.01, 0.5, 0.10, 0.01)
+    if st.button("Run Calibration"):
+        with st.spinner("Running the calibration set through the live pipeline..."):
+            try:
+                res = api_client.calibrate_conformal(alpha=alpha)
+                cal = res.get("calibration", {})
+                st.success(f"Calibrated: threshold={cal.get('threshold')} from {res.get('num_answerable')} answerable item(s).")
+                st.rerun()
+            except ApiError as e:
+                st.error(f"Calibration failed: {e}")
+
+st.divider()
+
 try:
     runs = api_client.list_eval_runs()
 except ApiError as e:

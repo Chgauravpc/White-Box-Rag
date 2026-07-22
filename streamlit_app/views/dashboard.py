@@ -23,6 +23,12 @@ except ApiError as e:
     audit_logs = []
     st.error(f"Could not load audit logs: {e}")
 
+try:
+    _queue = api_client.list_review_queue()
+    pending_review = len(_queue.get("data", [])) if isinstance(_queue, dict) else 0
+except ApiError:
+    pending_review = 0
+
 total_chunks = sum(d.get("chunk_count", 0) for d in documents)
 total_queries = len(audit_logs)
 
@@ -37,7 +43,7 @@ noncompliant_count = sum(1 for l in audit_logs if _is_status(l, "non_compliant")
 risk_flags = review_count + noncompliant_count
 safety_pct = round(100 * safe_count / total_queries, 1) if total_queries else 0.0
 
-col1, col2, col3, col4 = st.columns(4)
+col1, col2, col3, col4, col5 = st.columns(5)
 with col1:
     st.metric("Collections Ingested", len(documents), help=f"{total_chunks} chunks total")
 with col2:
@@ -45,6 +51,8 @@ with col2:
 with col3:
     st.metric("Risk Flags", risk_flags, help="Needs-review + non-compliant audit logs")
 with col4:
+    st.metric("Pending Review", pending_review, help="Flagged audits awaiting human resolution")
+with col5:
     st.metric("Safety Rate", f"{safety_pct}%", help="Fraction of logged queries with a Safe trust status")
 
 st.divider()
