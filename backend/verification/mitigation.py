@@ -14,6 +14,7 @@ no LLM-as-judge.
 from typing import List, Optional, Tuple
 
 from shared import config
+from shared.nli_policy import is_contradiction
 from shared.models import Claim, VerificationResult, TrustGate, NLIVerdict, TrustStatus
 from verification.trust_gate import compute_trust_gate
 from verification.conformal import load_active_threshold
@@ -31,7 +32,16 @@ ABSTENTION_MEAN_PENALTY_CEIL = config.ABSTENTION_MEAN_PENALTY_CEIL
 
 
 def _should_strip(verification: VerificationResult) -> bool:
-    if verification.verdict in (NLIVerdict.CONTRADICTION, NLIVerdict.CONTRADICTED):
+    if is_contradiction(verification.verdict):
+        return True
+    # A claim with no premise is unverifiable, not weakly verified. It is still
+    # stripped — retaining an unverifiable sentence in a mitigated answer would
+    # be a governance regression, and this module cannot tell legitimate
+    # discourse glue ("In summary, ...") from an ungrounded assertion without
+    # attribution context it isn't given. What changes is that the decision is
+    # now explicit rather than falling out of a 0.0 < STRIP_ENTAILMENT_FLOOR
+    # comparison against a score that was never measured.
+    if verification.evidence_status != "ok":
         return True
     if verification.entailment_score < STRIP_ENTAILMENT_FLOOR:
         return True
@@ -73,11 +83,18 @@ def filter_claims(
         attr = primary_attributions[i] if i < len(primary_attributions) else {}
 
         if _should_strip(verification):
-            reason = (
-                "contradiction"
-                if verification.verdict in (NLIVerdict.CONTRADICTION, NLIVerdict.CONTRADICTED)
-                else "low_confidence"
-            )
+            # The reason must name what actually happened. A claim with no
+            # premise is stripped for having no evidence, NOT because the NLI
+            # model scored it poorly — the model was never run on it, and its
+            # entailment_score is a structural 0.0. Reporting that as
+            # "low_confidence" attributed a model judgement to a model that
+            # never saw the claim.
+            if is_contradiction(verification.verdict):
+                reason = "contradiction"
+            elif verification.evidence_status != "ok":
+                reason = f"no_evidence:{verification.evidence_status}"
+            else:
+                reason = "low_confidence"
             retained_flags.append(False)
             filter_reasons.append(reason)
             continue

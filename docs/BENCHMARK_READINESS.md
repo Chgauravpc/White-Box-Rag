@@ -28,7 +28,7 @@ why a change happened.
 | **1** ✅ | Scoring & provenance core — a real label-vs-prediction scorer; run durability |
 | **2** ✅ | Multi-provider (Groq **+** OpenRouter) API key pool |
 | **3** 🟡 | Dataset scale-up — hundreds of labeled items, graded retrieval ground truth (W3.1 corpus identity ✅; labeling not started) |
-| **4** | Evaluation planes (retrieval / detector / end-to-end) + NLI multi-premise + domain-neutral normalization |
+| **4** 🟡 | Evaluation planes (retrieval / detector / end-to-end) + NLI multi-premise + domain-neutral normalization (W4.3 done, empty-premise guard done; planes + multi-premise open) |
 | **5** | External benchmark adapters (RAGTruth, HaluEval, FEVER, BEIR) |
 | **6** | Ablation & baseline comparison (plain-RAG vs. full governance) |
 | **7** | CLI entrypoints + two-tier CI (fast offline / nightly live) |
@@ -481,6 +481,116 @@ drift **policy** (should a `corpus_id` mismatch refuse to start a run, as W0.3
 does for calibration?) and any CI gating on it — there is nothing to gate
 until labels exist.
 
+### Phase 4 (partial) — NLI verdict integrity (finding #10, first half)
+
+**Done: the empty-premise guard and the shared penalty policy. Multi-premise
+verification deliberately NOT shipped (see below).**
+
+**An empty premise was being scored.** `xai_matrices.py::verify_claims_batch`
+built its NLI pairs as `(focused, claim)` and sent the whole batch to the
+CrossEncoder — including pairs whose premise was `""`. A CrossEncoder handed
+`("", claim)` does not error; it returns a perfectly well-formed 3-way
+softmax, and `argmax` turns that into a verdict. So a claim with **no evidence
+at all** received a real-looking verdict and confidence, indistinguishable
+downstream from a measured one. For a hallucination detector that is close to
+the worst available failure mode: the fabricated number flows into the trust
+gate, the Shapley contributions, the faithfulness score and the audit record.
+
+The model is now never called on an empty premise. Such claims get
+`NOT_ENOUGH_INFO` with structural zeros and a new
+`VerificationResult.evidence_status` recording *why* there was no premise:
+`no_premise` (the claim had no source passage — an unattributable sentence, or
+empty retrieval) or `normalizer_deleted_all` (a passage existed and
+`PREMISE_NORMALIZER` removed every line of it, which signals a normalizer
+misconfiguration and now also emits a `logger.warning` rather than a silent
+NEI). `evidence_status` exists precisely so nothing has to infer "was this
+measured?" from a score of 0.0. An all-empty batch also no longer calls
+`predict([])`.
+
+**Honest strip reasons.** `mitigation.py` stripped these claims via
+`entailment_score < STRIP_ENTAILMENT_FLOOR` and labelled them
+`"low_confidence"` — attributing a judgement to a model that never ran on the
+claim. They are still stripped (retaining an unverifiable sentence in a
+mitigated answer would be a governance regression, and this module cannot
+distinguish legitimate discourse glue from an ungrounded assertion without
+attribution context it isn't given), but the decision is now an explicit
+branch and the reason reads `no_evidence:<status>`.
+
+**One penalty policy instead of two copies.** `trust_gate.py` and
+`xai_matrices.py::compute_shapley_contributions` both convert
+`(verdict, entailment_score)` into penalties, and both docstrings promise they
+mirror each other. They had drifted **three** times. The third was live and
+undetected: Shapley matched the bare literals `"CONTRADICTION"` / `"NEUTRAL"`,
+while the trust gate matched the `NLIVerdict` enum *including* its canonical
+aliases. So a `CONTRADICTED` verdict was a contradiction to the gate and a
+non-contradiction to Shapley — which then also charged the confidence-band
+penalty the gate had skipped, silently diverging the two `overall_score`s.
+`NOT_ENOUGH_INFO` diverged the same way, and the empty-premise fix above is
+exactly what would have started producing it. New `shared/nli_policy.py` is
+now the single source of truth (`nli_penalty_flags`, plus verdict predicates
+accepting either spelling and either a string or an enum); both modules call
+it. The tests assert the two computations against **each other** across every
+verdict spelling and confidence band, so a future divergence fails regardless
+of what the penalty constants happen to be.
+
+**`POST /api/verify/` was dead.** `verification/routes.py` unpacked three
+values from `verify_all_claims`, which has returned a 4-tuple since W4.3 added
+`premise_deletions`. Every call raised `ValueError: too many values to
+unpack`. No test touched the route. Fixed, and
+`tests/test_verification_routes.py` now pins the arity contract.
+
+**Deliberately NOT shipped: multi-premise verification.** The other half of
+finding #10 is that each claim is scored against exactly one passage (its own
+cited `source_passage`). The obvious fix — score against all K retrieved
+chunks and take the max entailment — was designed, reviewed, and rejected:
+
+* `E[max over K]` rises with K for a noisy model, so the measured
+  hallucination rate would become a function of `FINAL_TOP_K`. A retrieval
+  change would then show up as a detector improvement — the exact confound the
+  Phase 4 plane split exists to *remove*.
+* Max-entailment destroys contradiction detection in this repo's flagship
+  case: if one chunk entails and an older edition contradicts, max selects the
+  entailing chunk and the conflict `verification/edition_conflict.py` exists
+  to surface disappears.
+* FEVER aggregates over a **fixed** evidence budget with a precedence rule
+  (any REFUTES → REFUTED), and RAGTruth treats the whole provided context as
+  one premise. Neither takes a raw max over an unbounded retrieved set.
+
+More fundamentally: there is still **no measurement of NLI verdict quality**
+in this repo (`scoring.detector_metrics` is written but called from nowhere,
+and `schema.reference_claims` is validated but read by nothing). Shipping a
+method change with no ground truth means Phase 5's first external benchmark
+would measure a method chosen by intuition. The correct order is: build the
+detector plane, get labels, run both arms, then choose. Multi-premise is
+therefore Phase 4's remaining work, to land behind `NLI_MULTI_PREMISE`
+(default off) once it can be justified with a number.
+
+**Known prerequisites for that work, recorded now rather than rediscovered:**
+`verify_claims_batch` and `build_entailment_matrix` apply *different* premise
+treatment to the same (claim, passage) pair, so the XAI entailment matrix the
+UI renders can already disagree with the verdict beside it — unify before
+widening. Every NLI/encoder call is synchronous inside `async def` (there is
+no `to_thread`/`run_in_executor` anywhere in `backend/`), so under
+`EVAL_CONCURRENCY` each query's NLI batch blocks the event loop; multi-premise
+multiplies that window by K, and `_encoder`/`_nli` are shared module-level
+instances that need a semaphore before any threading.
+`extract_relevant_sentences` would run N×K, re-parsing and re-embedding the
+same chunks once per claim — it needs a per-query per-chunk sentence/embedding
+cache first. And both `stability.py`'s independent NLI path and the persisted
+conformal threshold (calibrated against the current `mean_penalty`
+distribution) would need to follow.
+
+**Metric-breaking change, by design.** The empty-premise guard was changed
+outright rather than config-gated: a softmax over an empty string is not
+behavior worth preserving, and gating it would mean the default stays "report
+fabricated confidence". `mean_faithfulness_*`, `abstention_rate` and the trust
+status distribution will move for any corpus where claims go unattributed —
+previously those claims drew a random verdict from the model. Runs from before
+this change are not comparable to runs after it.
+
+**Tests:** `tests/test_nli_policy.py` (19) and
+`tests/test_verification_routes.py` (3). 302 tests pass (was 280).
+
 ### Pre-dating this effort, but foundational to it
 
 **Gemini → Groq/OpenRouter migration.** `shared/llm.py`: config-driven
@@ -499,8 +609,12 @@ per-key rate-limit state, key-blind retry).
   Corpus identity (W3.1) is done; see above for the open decisions blocking
   the labeling itself.
 - **Phase 4 (remainder)**: split the harness into retrieval/detector/
-  end-to-end planes; fix NLI's single-argmax-premise / empty-premise scoring
-  (finding #10).
+  end-to-end planes; multi-premise NLI (the empty-premise half of finding #10
+  is done - see above; the multi-premise half is deliberately blocked on
+  having detector ground truth to justify an aggregation rule). The detector
+  plane is the priority: `scoring.detector_metrics` and
+  `schema.reference_claims` both exist and are read by nothing, so NLI verdict
+  quality is currently unmeasured.
 - **Phase 5**: RAGTruth/HaluEval/FEVER/BEIR adapters — blocked on Phase 4's
   plane split and the W4.3 normalization fix (done), pending the user's
   prioritization/licensing decision.

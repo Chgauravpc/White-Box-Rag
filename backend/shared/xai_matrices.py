@@ -8,6 +8,7 @@ from sentence_transformers import SentenceTransformer, CrossEncoder
 from shared import config
 from shared.config import PREMISE_NORMALIZER
 from shared.text_normalize import normalize_premise
+from shared.nli_policy import nli_penalty_flags
 from shared.chunk_key import resolve_chunk_key
 
 logger = logging.getLogger(__name__)
@@ -112,6 +113,7 @@ def verify_claims_batch(claims_with_passages, profile=None):
     focused_pairs     = []
     focused_passages  = []
     premise_deletions = []
+    evidence_statuses = []
     for claim, raw_passage in claims_with_passages:
         # Always normalize first — even short passages may contain PDF artifacts
         # (or, under "financial_reports", table rows). Deletions are recorded per
@@ -121,22 +123,67 @@ def verify_claims_batch(claims_with_passages, profile=None):
             focused = extract_relevant_sentences(claim, stripped, profile=profile)
         else:
             focused = stripped  # already clean; no sentence selection needed
-        focused_pairs.append((focused, claim))
+
+        # An empty premise must never reach the model. A CrossEncoder handed
+        # ("", claim) still returns a normalized 3-way softmax, so a claim with
+        # NO evidence used to receive a real-looking verdict and confidence —
+        # the single worst failure mode available to a hallucination detector,
+        # because the fabricated score is indistinguishable downstream from a
+        # measured one.
+        if not focused.strip():
+            if raw_passage and raw_passage.strip():
+                # A passage existed and normalization consumed all of it. That
+                # is a normalizer misconfiguration (e.g. the financial_reports
+                # profile applied to a non-financial corpus), not a property of
+                # the claim — say so loudly rather than silently returning NEI.
+                status = "normalizer_deleted_all"
+                logger.warning(
+                    "PREMISE_NORMALIZER '%s' deleted the entire premise for claim %r "
+                    "(%d lines removed) — claim cannot be verified.",
+                    profile, claim[:80], len(deleted),
+                )
+            else:
+                status = "no_premise"
+        else:
+            status = "ok"
+
+        evidence_statuses.append(status)
         focused_passages.append(focused)
         premise_deletions.append(deleted)
-    scores = _nli.predict(focused_pairs, apply_softmax=True)
+        if status == "ok":
+            focused_pairs.append((focused, claim))
+
+    # Only claims with a real premise are scored. An all-empty batch must not
+    # call predict([]) — some backends raise, others return an empty array that
+    # would silently misalign the zip below.
+    scores = _nli.predict(focused_pairs, apply_softmax=True) if focused_pairs else []
+    score_iter = iter(scores)
+
     labels = ["contradiction", "entailment", "neutral"]
     results = []
-    for (claim, _), score_triplet, focused, deleted in zip(claims_with_passages, scores, focused_passages, premise_deletions):
-        top_idx = int(score_triplet.argmax())
+    for (claim, _), focused, deleted, status in zip(
+        claims_with_passages, focused_passages, premise_deletions, evidence_statuses
+    ):
+        if status == "ok":
+            score_triplet = next(score_iter)
+            verdict = labels[int(score_triplet.argmax())].upper()
+            entail, contra, neutral = (
+                float(score_triplet[1]), float(score_triplet[0]), float(score_triplet[2]),
+            )
+        else:
+            # NOT_ENOUGH_INFO is the honest verdict for "no evidence was
+            # examined". The zeros are structural, not measurements — which is
+            # exactly why `evidence_status` travels alongside them.
+            verdict, entail, contra, neutral = "NOT_ENOUGH_INFO", 0.0, 0.0, 0.0
         results.append({
             "claim_text":          claim,
-            "verdict":             labels[top_idx].upper(),
-            "entailment_score":    float(score_triplet[1]),
-            "contradiction_score": float(score_triplet[0]),
-            "neutral_score":       float(score_triplet[2]),
+            "verdict":             verdict,
+            "entailment_score":    entail,
+            "contradiction_score": contra,
+            "neutral_score":       neutral,
             "focused_passage":     focused,
             "premise_deletions":   deleted,
+            "evidence_status":     status,
         })
     return results
 
@@ -248,16 +295,20 @@ def compute_shapley_contributions(verifications, primary_attributions=None):
         verdict      = v.get("verdict", "").upper()
         entail_score = v.get("entailment_score", 1.0)
 
-        # NLI penalties
-        if verdict == "CONTRADICTION":
+        # NLI penalties — decided by shared/nli_policy.py, the same function
+        # verification/trust_gate.py calls. These used to be two independent
+        # copies of the rule, matching bare string literals here and the
+        # NLIVerdict enum (including its aliases) there, so a CONTRADICTED /
+        # NOT_ENOUGH_INFO verdict scored differently in the two computations.
+        flags = nli_penalty_flags(verdict, entail_score)
+        if flags["contradiction"]:
             phi += nli_penalties["contradiction"]; reasons.append("contradiction")
-        if verdict == "NEUTRAL":
+        if flags["neutral"]:
             phi += nli_penalties["neutral"]; reasons.append("neutral")
-        if verdict != "CONTRADICTION":
-            if entail_score < config.LOW_CONFIDENCE_CEIL:
-                phi += nli_penalties["low_confidence"]; reasons.append("low NLI confidence ({:.2f})".format(entail_score))
-            elif entail_score <= config.MID_CONFIDENCE_CEIL:
-                phi += nli_penalties["mid_confidence"]; reasons.append("mid NLI confidence ({:.2f})".format(entail_score))
+        if flags["low_confidence"]:
+            phi += nli_penalties["low_confidence"]; reasons.append("low NLI confidence ({:.2f})".format(entail_score))
+        if flags["mid_confidence"]:
+            phi += nli_penalties["mid_confidence"]; reasons.append("mid NLI confidence ({:.2f})".format(entail_score))
 
         # Attribution penalties (mirrors trust gate logic exactly)
         if i < len(primary_attributions):

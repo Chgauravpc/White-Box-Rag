@@ -132,6 +132,18 @@ class VerificationResult(BaseModel):
     verdict: NLIVerdict
     entailment_score: float = Field(ge=0.0, le=1.0)
     explanation: str = Field(default="")
+    evidence_status: str = Field(
+        default="ok",
+        description=(
+            "Whether an NLI premise existed at all. 'ok' — the model scored a real "
+            "premise. 'no_premise' — the claim had no source passage (unattributable "
+            "sentence, or empty retrieval), so no model was run. "
+            "'normalizer_deleted_all' — a source passage existed but PREMISE_NORMALIZER "
+            "removed every line of it, which signals a normalizer misconfiguration. "
+            "Anything other than 'ok' means entailment_score is a structural 0.0, not a "
+            "measurement — never treat it as a model confidence."
+        ),
+    )
 
 
 class EditionConflict(BaseModel):

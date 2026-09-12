@@ -131,6 +131,7 @@ White Box RAG/
 │   └── shared/                    # config, DB, LLM client (Groq/OpenRouter), XAI matrices, models
 │       ├── audit_chain.py         # tamper-evident hash-chain primitives (Governance)
 │       ├── chunk_key.py           # canonical globally-unique chunk identity
+│       ├── nli_policy.py          # single source of truth for NLI verdict penalties
 │       ├── corpus_manifest.py    # frozen content-hashed corpus snapshot + drift diff (W3.1)
 │       ├── hashing.py            # file/text content-hash primitives
 │       ├── text_normalize.py      # profile-based NLI premise normalization (generic default)
@@ -216,7 +217,7 @@ cd backend
 pytest
 ```
 
-280 tests, entirely against mocked ML models (`backend/conftest.py`) and a fake `AsyncOpenAI` client (`backend/tests/test_llm_pool.py`) — no API key or model download needed. Runs automatically on every push/PR via `.github/workflows/tests.yml`.
+302 tests, entirely against mocked ML models (`backend/conftest.py`) and a fake `AsyncOpenAI` client (`backend/tests/test_llm_pool.py`) — no API key or model download needed. Runs automatically on every push/PR via `.github/workflows/tests.yml`.
 
 ---
 

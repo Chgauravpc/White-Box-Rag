@@ -1,6 +1,7 @@
 from typing import List
 from shared import config
-from shared.models import VerificationResult, EditionConflict, TrustGate, TrustStatus, NLIVerdict
+from shared.models import VerificationResult, EditionConflict, TrustGate, TrustStatus
+from shared.nli_policy import nli_penalty_flags
 
 # Re-exported from config (not re-declared as a literal) — this used to be
 # an independent copy of the same value declared separately in
@@ -52,32 +53,25 @@ def compute_trust_gate(
     has_medium_confidence = False
 
     for v in verifications:
-        is_contradiction = v.verdict in (NLIVerdict.CONTRADICTION, NLIVerdict.CONTRADICTED)
-        if is_contradiction:
+        # Which penalties apply is decided in exactly one place
+        # (shared/nli_policy.py), which compute_shapley_contributions also
+        # calls — the two used to re-derive it independently and drifted.
+        flags = nli_penalty_flags(v.verdict, v.entailment_score)
+
+        if flags["contradiction"]:
             has_contradiction = True
             reasons.append(f"Contradiction: '{v.claim_text[:60]}...'")
-            overall_score -= config.PENALTY_CONTRADICTION
-        elif v.verdict in (NLIVerdict.NEUTRAL, NLIVerdict.NOT_ENOUGH_INFO):
+        if flags["neutral"]:
             has_neutral = True
             reasons.append(f"Neutral verdict: '{v.claim_text[:60]}...'")
-            overall_score -= config.PENALTY_NEUTRAL
+        if flags["low_confidence"]:
+            has_low_confidence = True
+            reasons.append(f"Low NLI confidence ({v.entailment_score:.2f})")
+        if flags["mid_confidence"]:
+            has_medium_confidence = True
+            reasons.append(f"Medium NLI confidence ({v.entailment_score:.2f})")
 
-        # Confidence-band penalty is skipped once a claim is already a
-        # CONTRADICTION — mirrors xai_matrices.py::compute_shapley_contributions
-        # exactly (same guard there). Without this guard a CONTRADICTION with
-        # entailment_score < LOW_CONFIDENCE_CEIL is double-penalized here but
-        # only single-penalized in the Shapley computation, so overall_score
-        # silently diverges from shapley["overall_score"] — exactly the
-        # consistency the docstring above promises.
-        if not is_contradiction:
-            if v.entailment_score < config.LOW_CONFIDENCE_CEIL:
-                has_low_confidence = True
-                reasons.append(f"Low NLI confidence ({v.entailment_score:.2f})")
-                overall_score -= config.PENALTY_LOW_CONFIDENCE
-            elif config.LOW_CONFIDENCE_CEIL <= v.entailment_score <= config.MID_CONFIDENCE_CEIL:
-                has_medium_confidence = True
-                reasons.append(f"Medium NLI confidence ({v.entailment_score:.2f})")
-                overall_score -= config.PENALTY_MID_CONFIDENCE
+        overall_score -= flags["penalty"]
 
     # 3. Attribution quality — same penalty scale as Shapley for score consistency
     for a in primary_attributions:

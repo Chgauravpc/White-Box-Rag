@@ -40,7 +40,10 @@ async def verify_all_claims(
                     f"Entail: {result['entailment_score']:.2f}, "
                     f"Contradict: {result['contradiction_score']:.2f}, "
                     f"Neutral: {result['neutral_score']:.2f}"
-                )
+                    if result.get("evidence_status", "ok") == "ok"
+                    else f"No NLI premise ({result.get('evidence_status')}) — claim not verifiable against any source."
+                ),
+                evidence_status=result.get("evidence_status", "ok"),
             )
         )
         focused_passages.append(result.get("focused_passage", claim.source_passage))
