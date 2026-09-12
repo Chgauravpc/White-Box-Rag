@@ -21,6 +21,13 @@ point this at the file.
         --input train.jsonl --wiki-dir wiki-pages/ \\
         --output ../data/benchmarks/fever_train.jsonl
 
+    # RAGTruth (span-level annotations on RAG responses - closest to this
+    # system's own task). Spans become sentence labels; the propagation rule is
+    # recorded on every item so the number stays comparable.
+    python scripts/convert_benchmark.py ragtruth \
+        --input response.jsonl --source-info source_info.jsonl --split test \
+        --output ../data/benchmarks/ragtruth_test.jsonl
+
     # anything else
     python scripts/convert_benchmark.py generic --input rows.jsonl \\
         --claim-field claim --premise-field context --label-field label \\
@@ -41,7 +48,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from eval.adapters import (  # noqa: E402
-    dataset_validity_report, from_fever, from_generic, from_halueval,
+    dataset_validity_report, from_fever, from_generic, from_halueval, from_ragtruth,
     write_detector_dataset,
 )
 from eval.fever_wiki import WikiSentenceIndex  # noqa: E402
@@ -68,10 +75,18 @@ def _load_rows(path: str) -> list[dict]:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("format", choices=["halueval", "fever", "generic"])
+    parser.add_argument("format", choices=["halueval", "fever", "ragtruth", "generic"])
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--task", default="qa", help="HaluEval: qa | dialogue | summarization")
+    parser.add_argument("--source-info", help="RAGTruth: path to source_info.jsonl")
+    parser.add_argument(
+        "--task-types", default="QA,Summary",
+        help="RAGTruth: comma-separated task types. Data2txt is excluded by default "
+             "because its premise is a structured business record rather than prose, "
+             "and an NLI model reading a serialized dict is doing a different task.",
+    )
+    parser.add_argument("--split", help="RAGTruth: train | test")
     parser.add_argument("--wiki-dir", help="FEVER: directory of wiki-pages JSONL files")
     parser.add_argument(
         "--wiki-index", default="../data/benchmarks/fever_wiki.sqlite",
@@ -123,6 +138,19 @@ def main():
         finally:
             if index is not None:
                 index.close()
+    elif args.format == "ragtruth":
+        if not args.source_info:
+            raise SystemExit(
+                "--source-info is required for ragtruth: the response file carries "
+                "claims and span annotations, the evidence text lives in source_info.jsonl"
+            )
+        sources = _load_rows(args.source_info)
+        print(f"Loaded {len(sources):,} source records from {args.source_info}")
+        items, report = from_ragtruth(
+            rows, sources,
+            task_types=tuple(t.strip() for t in args.task_types.split(",") if t.strip()),
+            split=args.split,
+        )
     else:
         items, report = from_generic(
             rows, claim_field=args.claim_field, premise_field=args.premise_field,

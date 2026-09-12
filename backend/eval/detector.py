@@ -146,7 +146,12 @@ def run_detector_eval(items: list[dict], profile: str = "none") -> dict:
         # Oriented so HIGHER means more likely hallucinated, per
         # scoring.detector_metrics's contract.
         scores_.append(1.0 - result["entailment_score"])
-        error_types.append(label)
+        # A dataset carrying a finer-grained error taxonomy (RAGTruth's
+        # Evident/Subtle x Conflict/Baseless Info) gets its recall broken down
+        # by that instead of by the coarse label. "Catches 94% of evident
+        # conflicts, 41% of subtle baseless info" is what makes the number
+        # actionable; falling back to the label keeps simpler datasets working.
+        error_types.append(item.get("error_type") or label)
 
         verdict_confusion.setdefault(label, {}).setdefault(result["verdict"], 0)
         verdict_confusion[label][result["verdict"]] += 1
@@ -157,6 +162,7 @@ def run_detector_eval(items: list[dict], profile: str = "none") -> dict:
             "verdict": result["verdict"],
             "entailment_score": result["entailment_score"],
             "evidence_status": result.get("evidence_status", "ok"),
+            "error_type": item.get("error_type") or "",
             "flagged": flagged,
             "correct": (label != SUPPORTED) == flagged,
         })

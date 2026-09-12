@@ -35,10 +35,16 @@ items anyway — they will be marked `premise_source="none"`.
 """
 
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 
 FEVER_LABELS = {"SUPPORTS", "REFUTES", "NOT ENOUGH INFO", "NOT_ENOUGH_INFO"}
+
+# Mirrors eval/detector.py's vocabulary. Declared here rather than imported at
+# module scope because every other cross-module reference in this file is a
+# deliberate function-local import.
+SUPPORTED, REFUTED, NEI = "SUPPORTED", "REFUTED", "NEI"
 
 
 def _item(id_, claim, premise, label, **extra):
@@ -311,3 +317,157 @@ def dataset_validity_report(items: list[dict]) -> dict:
                         "and AUROC is undefined")
 
     return {"n_items": len(items), "claim_length_by_label": lengths, "warnings": warnings}
+
+
+# ── RAGTruth ────────────────────────────────────────────────
+#
+# RAGTruth is the closest public benchmark to what this system actually does:
+# it annotates hallucinated SPANS inside LLM responses generated from retrieved
+# context. Two things follow from that shape.
+#
+# First, spans must become sentence labels, because this pipeline verifies
+# claims (sentences), not spans. The propagation rule is stated explicitly
+# rather than buried: **a sentence is hallucinated if its character range
+# overlaps any annotated span.** That is a real methodological choice — it
+# labels a whole sentence positive even when only three words of it are
+# unsupported — and it is reported in every converted item
+# (`propagation_rule`) so a number produced from this data can be compared
+# against someone else's only when their rule matches.
+#
+# Second, RAGTruth's four span types (Evident/Subtle x Conflict/Baseless Info)
+# are carried through as `error_type`, which `scoring.detector_metrics` breaks
+# down into per-type recall. "Catches 94% of evident conflicts, 41% of subtle
+# baseless info" is a far more useful statement than one F1, and the subtle
+# classes are exactly where single-premise NLI is expected to be weakest.
+
+RAGTRUTH_LABEL_MAP = {
+    # Contradicted by the context.
+    "Evident Conflict": REFUTED,
+    "Subtle Conflict": REFUTED,
+    # Not present in the context at all — unsupported rather than contradicted,
+    # which is NEI, not REFUTED. Both land in the detector's positive class
+    # (label != SUPPORTED) but the distinction is preserved for the breakdown.
+    "Evident Baseless Info": NEI,
+    "Subtle Baseless Info": NEI,
+}
+
+# Sentence boundary: terminal punctuation followed by whitespace, or a newline.
+# A regex rather than spaCy on purpose — the conversion must be deterministic
+# and reproducible by anyone, without a model download, and must yield exact
+# character offsets to intersect against span ranges.
+_SENTENCE_END = re.compile(r"(?<=[.!?])[\"')\]]*\s+|\n+")
+
+
+def split_sentences_with_offsets(text: str) -> list[tuple[int, int, str]]:
+    """Split into (start, end, text) triples with offsets into the original."""
+    spans, pos = [], 0
+    for match in _SENTENCE_END.finditer(text or ""):
+        end = match.start()
+        chunk = text[pos:end].strip()
+        if chunk:
+            start = pos + (len(text[pos:end]) - len(text[pos:end].lstrip()))
+            spans.append((start, start + len(chunk), chunk))
+        pos = match.end()
+    tail = (text or "")[pos:].strip()
+    if tail:
+        start = pos + (len(text[pos:]) - len(text[pos:].lstrip()))
+        spans.append((start, start + len(tail), tail))
+    return spans
+
+
+def _ragtruth_premise(source: dict) -> str:
+    """The evidence text for one source record.
+
+    QA carries the retrieved `passages` — the case that matches this system.
+    Summary carries the article. Data2txt carries a structured business record
+    rather than prose; it is serialized here, but an NLI model reasoning over a
+    serialized dict is doing a different task, so it is excluded by default.
+    """
+    info = source.get("source_info")
+    if isinstance(info, str):
+        return info.strip()
+    if isinstance(info, dict):
+        if "passages" in info:
+            return str(info["passages"]).strip()
+        return "\n".join(f"{k}: {v}" for k, v in info.items()).strip()
+    return ""
+
+
+def from_ragtruth(
+    responses, sources, task_types=("QA", "Summary"), split=None, id_prefix="ragtruth",
+) -> tuple[list[dict], dict]:
+    """Convert RAGTruth responses into sentence-level detector items.
+
+    `sources` may be a list of source records or a {source_id: record} map.
+    `task_types` defaults to QA and Summary; Data2txt is excluded because its
+    premise is a structured record rather than text (pass it explicitly to
+    include it). `split` filters to "train" or "test".
+    """
+    if not isinstance(sources, dict):
+        sources = {s.get("source_id"): s for s in sources}
+    wanted_tasks = set(task_types) if task_types else None
+
+    items = []
+    report = {
+        "n_responses": len(responses), "used_responses": 0,
+        "skipped_wrong_split": 0, "skipped_wrong_task": 0,
+        "skipped_no_source": 0, "skipped_no_premise": 0, "skipped_no_sentences": 0,
+        "sentences_total": 0, "sentences_hallucinated": 0,
+        "by_error_type": {},
+        "propagation_rule": "sentence_overlaps_any_span",
+    }
+
+    for response in responses:
+        if split and response.get("split") != split:
+            report["skipped_wrong_split"] += 1
+            continue
+        source = sources.get(response.get("source_id"))
+        if source is None:
+            report["skipped_no_source"] += 1
+            continue
+        if wanted_tasks and source.get("task_type") not in wanted_tasks:
+            report["skipped_wrong_task"] += 1
+            continue
+        premise = _ragtruth_premise(source)
+        if not premise:
+            report["skipped_no_premise"] += 1
+            continue
+
+        text = response.get("response") or ""
+        sentences = split_sentences_with_offsets(text)
+        if not sentences:
+            report["skipped_no_sentences"] += 1
+            continue
+
+        spans = [s for s in (response.get("labels") or [])
+                 if isinstance(s, dict) and s.get("start") is not None and s.get("end") is not None]
+        report["used_responses"] += 1
+
+        for idx, (start, end, sentence) in enumerate(sentences):
+            # Half-open interval intersection; a span touching only the
+            # boundary is not an overlap.
+            hits = [s for s in spans if s["start"] < end and start < s["end"]]
+            report["sentences_total"] += 1
+            if hits:
+                # Most severe wins when a sentence carries several span types:
+                # a Conflict is a stronger claim about the sentence than
+                # Baseless Info, and reporting the weaker one would understate
+                # what the detector had to catch.
+                hits.sort(key=lambda s: 0 if "Conflict" in str(s.get("label_type")) else 1)
+                error_type = str(hits[0].get("label_type") or "Unknown")
+                label = RAGTRUTH_LABEL_MAP.get(error_type, NEI)
+                report["sentences_hallucinated"] += 1
+                report["by_error_type"][error_type] = report["by_error_type"].get(error_type, 0) + 1
+            else:
+                error_type, label = "", SUPPORTED
+
+            items.append(_item(
+                f"{id_prefix}-{response.get('id', 'x')}-{idx}", sentence, premise, label,
+                source="ragtruth", premise_source="gold",
+                task_type=source.get("task_type"), model=response.get("model"),
+                split=response.get("split"), error_type=error_type,
+                propagation_rule="sentence_overlaps_any_span",
+            ))
+
+    report["n_items"] = len(items)
+    return items, report

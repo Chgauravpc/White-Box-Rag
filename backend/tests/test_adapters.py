@@ -14,8 +14,8 @@ import json
 import pytest
 
 from eval.adapters import (
-    dataset_validity_report, from_fever, from_generic, from_halueval,
-    write_detector_dataset,
+    dataset_validity_report, from_fever, from_generic, from_halueval, from_ragtruth,
+    split_sentences_with_offsets, write_detector_dataset,
 )
 from eval.detector import run_detector_eval, validate_detector_item
 
@@ -238,3 +238,126 @@ class TestValidityReport:
         assert stats["SUPPORTED"]["median_words"] == 2
         assert stats["REFUTED"]["median_words"] == 6
         assert stats["SUPPORTED"]["n"] == 3
+
+
+class TestSentenceSplitting:
+    """Span-to-sentence propagation needs exact character offsets, so the
+    splitter is tested on offsets, not just on the text it returns."""
+
+    def test_offsets_index_back_into_the_original(self):
+        text = "First sentence. Second one! Third?"
+        for start, end, sent in split_sentences_with_offsets(text):
+            assert text[start:end] == sent
+
+    def test_splits_on_terminal_punctuation_and_newlines(self):
+        assert [s for _, _, s in split_sentences_with_offsets("One. Two.\nThree.")] == [
+            "One.", "Two.", "Three."
+        ]
+
+    def test_empty_text_yields_nothing(self):
+        assert split_sentences_with_offsets("") == []
+
+    def test_text_without_terminal_punctuation_is_one_sentence(self):
+        assert [s for _, _, s in split_sentences_with_offsets("no final period")] == [
+            "no final period"
+        ]
+
+
+class TestRagTruth:
+    def _source(self, source_id=1, task_type="QA"):
+        return {"source_id": source_id, "task_type": task_type,
+                "source_info": {"question": "q", "passages": "The reserves rose to 700B."}}
+
+    def _response(self, response, labels=(), split="test", id_=1, source_id=1):
+        return {"id": id_, "source_id": source_id, "split": split, "model": "m",
+                "response": response, "labels": list(labels)}
+
+    def test_sentence_overlapping_a_span_is_labelled_hallucinated(self):
+        text = "Reserves rose to 700B. They then fell to zero."
+        span = {"start": text.index("They"), "end": len(text),
+                "label_type": "Evident Conflict"}
+        items, report = from_ragtruth(
+            [self._response(text, [span])], [self._source()], split="test"
+        )
+        assert [i["label"] for i in items] == ["SUPPORTED", "REFUTED"]
+        assert report["sentences_hallucinated"] == 1
+
+    def test_unannotated_response_yields_all_supported(self):
+        items, _ = from_ragtruth(
+            [self._response("One fact. Another fact.")], [self._source()], split="test"
+        )
+        assert {i["label"] for i in items} == {"SUPPORTED"}
+
+    def test_baseless_info_maps_to_nei_not_refuted(self):
+        """Baseless Info means absent from the context, not contradicted by it —
+        that is NEI. Both are in the detector's positive class, but collapsing
+        them would lose the distinction the breakdown depends on."""
+        text = "A grounded claim. An invented detail."
+        span = {"start": text.index("An invented"), "end": len(text),
+                "label_type": "Evident Baseless Info"}
+        items, _ = from_ragtruth([self._response(text, [span])], [self._source()], split="test")
+        assert items[1]["label"] == "NEI"
+        assert items[1]["error_type"] == "Evident Baseless Info"
+
+    def test_conflict_wins_when_a_sentence_carries_several_span_types(self):
+        """Reporting the weaker type would understate what the detector had to
+        catch."""
+        text = "One sentence with two problems."
+        spans = [{"start": 0, "end": 5, "label_type": "Subtle Baseless Info"},
+                 {"start": 6, "end": 12, "label_type": "Evident Conflict"}]
+        items, _ = from_ragtruth([self._response(text, spans)], [self._source()], split="test")
+        assert items[0]["error_type"] == "Evident Conflict"
+
+    def test_boundary_touching_span_is_not_an_overlap(self):
+        text = "First sentence. Second sentence."
+        end_of_first = text.index(".") + 1
+        span = {"start": end_of_first, "end": len(text), "label_type": "Evident Conflict"}
+        items, _ = from_ragtruth([self._response(text, [span])], [self._source()], split="test")
+        assert items[0]["label"] == "SUPPORTED"
+
+    def test_split_filter(self):
+        items, report = from_ragtruth(
+            [self._response("A fact.", split="train")], [self._source()], split="test"
+        )
+        assert items == [] and report["skipped_wrong_split"] == 1
+
+    def test_data2txt_excluded_by_default(self):
+        """Its premise is a structured business record, not prose — an NLI
+        model reading a serialized dict is doing a different task."""
+        items, report = from_ragtruth(
+            [self._response("A fact.")], [self._source(task_type="Data2txt")], split="test"
+        )
+        assert items == [] and report["skipped_wrong_task"] == 1
+
+    def test_data2txt_can_be_requested_explicitly(self):
+        items, _ = from_ragtruth(
+            [self._response("A fact.")], [self._source(task_type="Data2txt")],
+            task_types=("Data2txt",), split="test",
+        )
+        assert len(items) == 1
+
+    def test_qa_premise_is_the_retrieved_passages(self):
+        items, _ = from_ragtruth([self._response("A fact.")], [self._source()], split="test")
+        assert items[0]["premise"] == "The reserves rose to 700B."
+
+    def test_summary_premise_is_the_article_string(self):
+        src = {"source_id": 1, "task_type": "Summary", "source_info": "The article text."}
+        items, _ = from_ragtruth([self._response("A fact.")], [src], split="test")
+        assert items[0]["premise"] == "The article text."
+
+    def test_missing_source_is_counted_not_fatal(self):
+        items, report = from_ragtruth(
+            [self._response("A fact.", source_id=999)], [self._source()], split="test"
+        )
+        assert items == [] and report["skipped_no_source"] == 1
+
+    def test_propagation_rule_is_recorded_on_every_item(self):
+        """The rule is a methodological choice; a number is only comparable to
+        someone else's if their rule matches, so it travels with the data."""
+        items, report = from_ragtruth([self._response("A fact.")], [self._source()], split="test")
+        assert report["propagation_rule"] == "sentence_overlaps_any_span"
+        assert all(i["propagation_rule"] == "sentence_overlaps_any_span" for i in items)
+
+    def test_items_are_valid_detector_items(self):
+        items, _ = from_ragtruth([self._response("A fact. Another.")], [self._source()], split="test")
+        assert all(validate_detector_item(i) == [] for i in items)
