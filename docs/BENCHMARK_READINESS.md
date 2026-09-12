@@ -824,8 +824,29 @@ survives, since precision/recall then degenerate and AUROC is undefined.
 Verified end to end on synthetic HaluEval-shaped rows: convert → 6 balanced
 items → real model → clean metrics.
 
-**Tests:** `tests/test_adapters.py` (19) plus 5 label-order cases in
-`tests/test_nli_policy.py`. 364 tests pass (was 340).
+#### FEVER's wiki dump, indexed to disk
+
+`scripts/convert_benchmark.py` originally loaded the wiki dump into a Python
+dict to resolve evidence pointers. Measured on a synthetic dump and
+extrapolated to FEVER's ~5.4M sentences, that costs **~1.2 GB of RAM** — not
+the several GB first assumed, but enough to matter on a development machine,
+and paid again on every single run because nothing was cached.
+
+New `eval/fever_wiki.py` streams the dump into a SQLite index instead
+(`WITHOUT ROWID`, keyed on `(page, sentence_id)` — the only query this ever
+runs is an exact-match lookup on that pair). Measured against the dict on the
+same 200k-sentence dump: **45.4 MB → 3.8 MB peak Python heap, a 12x
+reduction**, extrapolating to ~104 MB of RAM plus ~0.5 GB on disk for the full
+dump. The index is built once and reused, so a second conversion run skips
+parsing entirely. `WikiSentenceIndex.as_resolver()` satisfies
+`from_fever`'s `resolve_evidence(page, sentence_id)` contract directly.
+
+Duplicate pages (which real dumps contain) no longer abort the build, and
+malformed rows are counted rather than fatal.
+
+**Tests:** `tests/test_adapters.py` (19), `tests/test_fever_wiki.py` (12),
+plus 5 label-order cases in `tests/test_nli_policy.py`. 376 tests pass
+(was 340).
 
 **What is still missing is only the data.** Point the converter at a real
 downloaded benchmark and the detector plane produces a real, externally

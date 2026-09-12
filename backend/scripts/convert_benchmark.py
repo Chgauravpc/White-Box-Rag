@@ -13,7 +13,10 @@ point this at the file.
     python scripts/convert_benchmark.py halueval \\
         --input qa_data.json --task qa --output ../data/benchmarks/halueval_qa.jsonl
 
-    # FEVER (needs the wiki dump to resolve evidence pointers to sentences)
+    # FEVER (needs the wiki dump to resolve evidence pointers to sentences).
+    # The dump is streamed into an on-disk SQLite index once (~5.4M sentences);
+    # peak memory stays in the tens of MB rather than the 4-6 GB an in-memory
+    # dict would cost. Later runs reuse the index and can omit --wiki-dir.
     python scripts/convert_benchmark.py fever \\
         --input train.jsonl --wiki-dir wiki-pages/ \\
         --output ../data/benchmarks/fever_train.jsonl
@@ -40,6 +43,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from eval.adapters import (  # noqa: E402
     from_fever, from_generic, from_halueval, write_detector_dataset,
 )
+from eval.fever_wiki import WikiSentenceIndex  # noqa: E402
 
 
 def _load_rows(path: str) -> list[dict]:
@@ -61,45 +65,6 @@ def _load_rows(path: str) -> list[dict]:
         return rows
 
 
-def _build_wiki_lookup(wiki_dir: str):
-    """Index FEVER's wiki-pages dump as {(page, sentence_id): text}.
-
-    The dump is a directory of JSONL files whose `lines` field is
-    "0\\tFirst sentence.\\t...\\n1\\tSecond sentence.\\t...". Loaded into memory
-    because random access across ~5M sentences a claim at a time is far
-    slower; expect several GB of RAM for the full dump.
-    """
-    lookup = {}
-    files = sorted(
-        os.path.join(wiki_dir, n) for n in os.listdir(wiki_dir)
-        if n.endswith((".jsonl", ".json"))
-    )
-    if not files:
-        raise SystemExit(f"No .jsonl files found in {wiki_dir}")
-    for path in files:
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    page = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                pid = page.get("id")
-                if not pid:
-                    continue
-                for entry in (page.get("lines") or "").split("\n"):
-                    parts = entry.split("\t")
-                    if len(parts) < 2 or not parts[0].isdigit():
-                        continue
-                    text = parts[1].strip()
-                    if text:
-                        lookup[(pid, int(parts[0]))] = text
-        print(f"  indexed {os.path.basename(path)} ({len(lookup):,} sentences so far)")
-    return lookup
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("format", choices=["halueval", "fever", "generic"])
@@ -107,6 +72,14 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--task", default="qa", help="HaluEval: qa | dialogue | summarization")
     parser.add_argument("--wiki-dir", help="FEVER: directory of wiki-pages JSONL files")
+    parser.add_argument(
+        "--wiki-index", default="../data/benchmarks/fever_wiki.sqlite",
+        help="FEVER: where to build/reuse the on-disk sentence index. Built once "
+             "from --wiki-dir, then reused; peak memory stays in the tens of MB "
+             "regardless of dump size.",
+    )
+    parser.add_argument("--rebuild-wiki-index", action="store_true",
+                        help="FEVER: re-index even if the index already exists.")
     parser.add_argument(
         "--keep-unresolvable-nei", action="store_true",
         help="FEVER: keep NOT ENOUGH INFO claims that have no gold evidence. "
@@ -126,18 +99,29 @@ def main():
     if args.format == "halueval":
         items, report = from_halueval(rows, task=args.task)
     elif args.format == "fever":
-        resolve = None
-        if args.wiki_dir:
-            print(f"Indexing wiki dump at {args.wiki_dir} (this takes a while)...")
-            lookup = _build_wiki_lookup(args.wiki_dir)
-            print(f"  {len(lookup):,} sentences indexed")
-            resolve = lambda page, sent_id: lookup.get((page, sent_id), "")  # noqa: E731
+        resolve, index = None, None
+        have_index = os.path.exists(args.wiki_index) and not args.rebuild_wiki_index
+        if args.wiki_dir or have_index:
+            if args.wiki_dir:
+                print(f"Building wiki index at {args.wiki_index} from {args.wiki_dir} ...")
+                build = WikiSentenceIndex.build(
+                    args.wiki_dir, args.wiki_index, force=args.rebuild_wiki_index,
+                    progress=lambda name, n: print(f"  {name}: {n:,} sentences so far"),
+                )
+                print(f"  {build['status']}: {build['sentences']:,} sentences")
+            index = WikiSentenceIndex(args.wiki_index)
+            print(f"  index ready ({len(index):,} sentences)")
+            resolve = index.as_resolver()
         else:
-            print("  ! no --wiki-dir given: evidence cannot be resolved, so every")
-            print("    SUPPORTS/REFUTES row will be dropped. Supply the dump.", file=sys.stderr)
-        items, report = from_fever(
-            rows, resolve_evidence=resolve, keep_unresolvable_nei=args.keep_unresolvable_nei
-        )
+            print("  ! no --wiki-dir and no existing --wiki-index: evidence cannot be", file=sys.stderr)
+            print("    resolved, so every SUPPORTS/REFUTES row will be dropped.", file=sys.stderr)
+        try:
+            items, report = from_fever(
+                rows, resolve_evidence=resolve, keep_unresolvable_nei=args.keep_unresolvable_nei
+            )
+        finally:
+            if index is not None:
+                index.close()
     else:
         items, report = from_generic(
             rows, claim_field=args.claim_field, premise_field=args.premise_field,
