@@ -661,6 +661,78 @@ plumbing is now in place for both; neither has been run here.
 
 **Tests:** `tests/test_detector.py` (24). 326 tests pass (was 302).
 
+### Phase 4 (continued) — the retrieval plane, and freezing a corpus for real
+
+**Done: retrieval can be scored without generating, and W3.1's manifest is
+now reachable and actually used.**
+
+`run_query_pipeline` calls `rag_query` unconditionally, so scoring retrieval
+over 1,000 queries meant 1,000+ LLM calls. That is what made a BEIR-scale
+sweep unaffordable and a per-commit retrieval regression check impossible. New
+`eval/retrieval.py` runs `hybrid_retrieve` and scores it against graded
+`relevant_chunk_keys` — **zero LLM calls**, no generation, no verification, no
+audit write. A test pins that by making `call_llm` raise.
+
+It reuses the v2 dataset shape rather than inventing a third format, so the
+same dataset drives the end-to-end and retrieval planes and the two cannot
+disagree about what "relevant" means. v1 datasets still load via the schema's
+auto-upgrade.
+
+**Two failure modes it is built to avoid**, both of which this repo has
+already shipped once in some form:
+
+* *Identity namespace.* Retrieved ids and labeled ids must be the same kind of
+  string. The removed `retrieval_hit_rate` compared bare section ids against
+  canonical chunk keys and was therefore pinned at 0.0 forever. The plane
+  resolves retrieved chunks through the same `resolve_chunk_key` the retriever
+  uses, and the tests assert real hits and rank sensitivity rather than just
+  "a number came out".
+* *Unlabeled items counted as misses.* An item with no ground truth cannot
+  speak to retrieval quality; averaging it in as a zero would understate the
+  system in proportion to how incomplete the labels are. Such items are
+  excluded and counted separately (`n_unlabeled`).
+
+**Label durability — where the corpus manifest finally pays off.** A
+`relevant_chunk_key` encodes a position, so re-chunking moves it and a label
+silently starts pointing at different text; the metric keeps producing a
+number, just not the one you think. Pass `corpus_id` and labels carrying a
+`text_sha256` are resolved by **content** first, following a moved chunk
+instead of being scored as a miss, and the response carries a `label_health`
+block saying what fraction of labels still resolve. Measured end to end on a
+corpus that was frozen and then deliberately re-chunked:
+
+| label | manifest | hit@5 | label_health |
+|---|---|---|---|
+| key only | none | 0.0 | *(no signal — silently wrong)* |
+| key only | frozen | 0.0 | `missing=1` — wrong, but visible |
+| key + `text_sha256` | frozen | **1.0** | `moved=1` — followed the content |
+
+The first row is the one that matters: without any of this, a stale label
+produces a confident, wrong 0.0 and nothing anywhere says so.
+
+**The manifest is now reachable.** W3.1 built `build_manifest`/`save_manifest`
+and nothing ever called them, so no corpus could actually be frozen.
+`POST /api/eval/corpus/freeze` snapshots the live corpus under a `corpus_id`
+and returns its hash, counts, chunking config and any SQLite/ChromaDB
+`inconsistencies` (surfaced, not buried — a manifest over a corpus whose two
+stores disagree is a manifest of a problem). `GET /api/eval/corpus/{id}`
+returns the frozen summary plus live drift, classified as
+moved / content_changed / removed / added. Asking for durability checking
+against a manifest that does not exist is a 404, not a quietly weaker
+guarantee.
+
+**Endpoints:** `POST /api/eval/retrieval`, `POST /api/eval/corpus/freeze`,
+`GET /api/eval/corpus/{corpus_id}`.
+
+**Tests:** `tests/test_retrieval_plane.py` (14). 340 tests pass (was 326).
+
+**Still missing, deliberately:** plane-aware persistence. Neither the
+detector nor the retrieval plane writes to `eval_runs`, because that table's
+columns and metric shape describe an end-to-end run — mixing planes there
+would make incomparable things indistinguishable rows and let
+`resume_from_run_id` resume across planes. A `plane` column plus a per-plane
+metric envelope is the remaining piece of the split.
+
 ### Pre-dating this effort, but foundational to it
 
 **Gemini → Groq/OpenRouter migration.** `shared/llm.py`: config-driven
@@ -678,14 +750,11 @@ per-key rate-limit state, key-blind retry).
   graded `relevant_chunk_keys`, and an actually-frozen benchmark corpus.
   Corpus identity (W3.1) is done; see above for the open decisions blocking
   the labeling itself.
-- **Phase 4 (remainder)**: the retrieval and end-to-end planes (the
-  **detector plane is done** - see above), plane-aware persistence in
-  `eval_runs`, and multi-premise NLI. Multi-premise is no longer blocked on
-  *machinery* - the detector plane can now score both arms - only on a labeled
-  dataset to score them with. The retrieval plane is the other clear win:
-  today retrieval cannot be scored without generating, since
-  `run_query_pipeline` calls `rag_query` unconditionally, so a retrieval-only
-  plane would make BEIR-scale sweeps affordable (zero LLM calls).
+- **Phase 4 (remainder)**: plane-aware persistence in `eval_runs` (a `plane`
+  column plus a per-plane metric envelope) and multi-premise NLI. The
+  **detector and retrieval planes are both done** - see above. Multi-premise
+  is no longer blocked on machinery, since the detector plane can score both
+  arms; it is blocked only on a labeled dataset to score them with.
 - **Phase 5**: RAGTruth/HaluEval/FEVER/BEIR adapters — blocked on Phase 4's
   plane split and the W4.3 normalization fix (done), pending the user's
   prioritization/licensing decision.

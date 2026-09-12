@@ -7,6 +7,10 @@ Endpoints:
   GET  /api/eval/runs/{id}    — Full run detail with per-query breakdown
   POST /api/eval/detector     — Detector plane: score claim verification against
                                 per-claim labels (no retrieval, no LLM)
+  POST /api/eval/retrieval    — Retrieval plane: score hybrid retrieval against
+                                graded relevant_chunk_keys (no LLM)
+  POST /api/eval/corpus/freeze — Freeze a content-hashed corpus manifest
+  GET  /api/eval/corpus/{id}  — Frozen manifest summary + drift vs. the live corpus
 """
 
 import json
@@ -18,6 +22,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from eval.detector import run_detector_eval_from_file
+from eval.retrieval import run_retrieval_eval_from_file
 from eval.harness import run_eval, run_calibration, _load_dataset, capture_run_provenance
 from shared.database import insert_eval_run_started, finalize_eval_run, list_eval_runs, get_eval_run
 from verification.conformal import load_active_calibration, min_n_for_alpha
@@ -47,6 +52,19 @@ class DetectorEvalRequest(BaseModel):
     # "none" leaves a benchmark's own evidence text untouched; anything else
     # makes the number un-reproducible outside this repo.
     premise_normalizer: str = "none"
+
+
+class RetrievalEvalRequest(BaseModel):
+    dataset_path: str | None = None
+    top_k: int | None = None
+    # When set, labels are resolved against this frozen manifest (content
+    # first), and the response carries a label_health block. Omit to score
+    # without label-durability checking.
+    corpus_id: str | None = None
+
+
+class FreezeCorpusRequest(BaseModel):
+    corpus_id: str
 
 
 class CalibrateRequest(BaseModel):
@@ -133,6 +151,88 @@ async def trigger_detector_eval(request: DetectorEvalRequest):
     except Exception as exc:
         logger.exception("Detector eval failed")
         raise HTTPException(status_code=500, detail=f"Detector eval failed: {exc}")
+
+
+@router.post("/retrieval")
+async def trigger_retrieval_eval(request: RetrievalEvalRequest):
+    """Score hybrid retrieval against graded `relevant_chunk_keys`.
+
+    Zero LLM calls — `run_query_pipeline` generates unconditionally, so this
+    is the only way to measure retrieval without paying for generation, and
+    the only way a BEIR-scale sweep or a per-commit retrieval regression check
+    is affordable.
+
+    Pass `corpus_id` to resolve labels against a frozen manifest: labels that
+    carry a `text_sha256` then follow their content across a re-chunk instead
+    of silently becoming misses, and the response says what fraction of labels
+    still resolve.
+    """
+    dataset_path = request.dataset_path or DEFAULT_DATASET_PATH
+    if not os.path.exists(dataset_path):
+        raise HTTPException(status_code=404, detail=f"Dataset not found: {dataset_path}")
+    try:
+        return run_retrieval_eval_from_file(
+            dataset_path, top_k=request.top_k, corpus_id=request.corpus_id
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Retrieval eval failed")
+        raise HTTPException(status_code=500, detail=f"Retrieval eval failed: {exc}")
+
+
+@router.post("/corpus/freeze")
+async def freeze_corpus(request: FreezeCorpusRequest):
+    """Snapshot the live corpus as a frozen, content-hashed manifest.
+
+    This is what makes a labeled retrieval dataset durable: the manifest
+    records every chunk's key AND the hash of its normalized text, so a later
+    re-chunk is detectable (and recoverable) instead of silently re-pointing
+    every label at different text.
+    """
+    from shared.corpus_manifest import build_manifest, save_manifest
+
+    try:
+        manifest = build_manifest()
+        path = save_manifest(manifest, request.corpus_id)
+    except Exception as exc:
+        logger.exception("Corpus freeze failed")
+        raise HTTPException(status_code=500, detail=f"Corpus freeze failed: {exc}")
+    return {
+        "corpus_id": request.corpus_id,
+        "path": path,
+        "corpus_hash": manifest["corpus_hash"],
+        "document_count": manifest["document_count"],
+        "chunk_count": manifest["chunk_count"],
+        "chunking_config": manifest["chunking_config"],
+        # Surfaced, not buried: a manifest over a corpus whose SQLite and
+        # ChromaDB disagree is a manifest of a problem.
+        "inconsistencies": manifest["inconsistencies"],
+    }
+
+
+@router.get("/corpus/{corpus_id}")
+async def get_corpus_manifest(corpus_id: str):
+    """Frozen manifest summary plus drift against the live corpus."""
+    from shared.corpus_manifest import build_manifest, diff_manifest, load_manifest
+
+    frozen = load_manifest(corpus_id)
+    if frozen is None:
+        raise HTTPException(status_code=404, detail=f"No frozen corpus manifest '{corpus_id}'")
+    try:
+        live = build_manifest()
+        drift = diff_manifest(frozen, live)
+    except Exception as exc:
+        logger.exception("Corpus drift check failed")
+        raise HTTPException(status_code=500, detail=f"Corpus drift check failed: {exc}")
+    return {
+        "corpus_id": corpus_id,
+        "corpus_hash": frozen.get("corpus_hash"),
+        "document_count": frozen.get("document_count"),
+        "chunk_count": frozen.get("chunk_count"),
+        "chunking_config": frozen.get("chunking_config"),
+        "drift": drift,
+    }
 
 
 @router.post("/calibrate")
