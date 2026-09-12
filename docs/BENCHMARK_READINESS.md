@@ -1020,6 +1020,103 @@ metrics rather than end-to-end fields as zeros.
 **Tests:** `tests/test_eval_planes.py` (8) plus 5 premise-consistency cases in
 `tests/test_nli_policy.py`. 394 tests pass (was 381).
 
+### The first valid external measurement — RAGTruth
+
+**This is the number the whole benchmark-readiness effort existed to produce.**
+It is not a good number, and what it says is specific and actionable.
+
+Setup: RAGTruth `test` split, QA + Summary tasks, spans propagated to sentence
+labels by overlap (`propagation_rule="sentence_overlaps_any_span"`), premise
+normalizer `none`, prediction taken from the shipped
+`mitigation._should_strip` rule. 1,502 sentences sampled by whole response so
+prevalence is preserved. The dataset passes `dataset_validity_report` — median
+claim length 16/17/20 words across SUPPORTED/NEI/REFUTED, no length shortcut.
+
+| metric | value |
+|---|---|
+| n | 1,502 (97 positives, 6.5% prevalence) |
+| precision | 0.102 [0.083, 0.125] |
+| recall | 0.835 [0.749, 0.896] |
+| F1 | 0.182 |
+| specificity | 0.495 |
+| balanced accuracy | 0.665 |
+| MCC | 0.162 [0.119, 0.202] |
+| **AUROC** | **0.727** |
+| AUPRC | 0.130 |
+
+Confusion: TP 81, FN 16, TN 695, **FP 710**.
+
+#### Three findings, in order of usefulness
+
+**1. The ranking works; the operating point does not.** AUROC 0.727 says the
+entailment score does separate hallucinated sentences from grounded ones —
+compare HaluEval QA's 0.526, which was chance. But at the shipped threshold
+the system flags **710 of 1,405 grounded sentences**, almost exactly half, for
+81 true catches. Precision 0.10. A reviewer would stop reading at that
+precision, and an operator would turn the feature off within a day.
+
+This is the distinction `verdict_confusion` was added to expose: "the NLI model
+is wrong" versus "the strip threshold is miscalibrated". Here it is decisively
+the threshold. `STRIP_ENTAILMENT_FLOOR = 0.5` was chosen by hand and has never
+been fitted to data; 600 of those 1,405 grounded sentences came back NEUTRAL,
+which on a long article premise is an ordinary outcome for a true sentence
+whose supporting detail did not make the top-3 selection. This is exactly what
+the conformal calibration machinery (Phase 0/W0.3) exists to set, and it has
+never been run against a labeled external set — now it can be.
+
+**2. Recall is inverted across error types, and that is the real bug.**
+
+| RAGTruth error type | recall | n |
+|---|---|---|
+| Evident Baseless Info | 0.938 | 64 |
+| Subtle Baseless Info | 0.857 | 7 |
+| **Evident Conflict** | **0.542** | 24 |
+| Subtle Conflict | 1.0 | 2 |
+
+A claim the evidence **flatly contradicts** is caught barely half the time,
+while a claim the evidence merely fails to mention is caught 94% of the time.
+That is backwards: a contradiction is the easier and more dangerous case.
+
+**3. The mechanism is visible in the verdict confusion.** Of 26 REFUTED
+sentences the model returned CONTRADICTION for only **4**, NEUTRAL for 11, and
+**ENTAILMENT for 11**. A contradicted claim being scored as entailed is not a
+threshold problem — the model was shown a premise that genuinely supports the
+claim's surface form. That points at premise *selection*:
+`extract_relevant_sentences` picks the top-`NLI_TOP_K` sentences most
+**similar** to the claim, and for a contradiction the sentence that refutes it
+is often lexically *less* similar than nearby supporting context. The
+selector systematically hands the model the wrong three sentences.
+
+#### What this settles
+
+Multi-premise NLI has been deferred twice in this effort for want of evidence
+to choose an aggregation rule with. There is now evidence, and it redirects the
+work: the problem is not primarily aggregating over K retrieved chunks, it is
+that **similarity-ranked sentence selection loses contradictions**. A fix
+should be evaluated on `Evident Conflict` recall specifically — currently
+0.542 — with precision held constant. Candidate directions, now testable
+against a real number rather than argued from first principles: select
+premises by NLI score rather than embedding similarity, keep a contradiction
+-oriented selection alongside the similarity one, or score against the whole
+premise when it fits the model's context.
+
+#### Honest limits
+
+Sampled (1,502 of 12,209 converted sentences), single split, two task types,
+one NLI checkpoint. `Subtle Conflict` n=2 and `Subtle Baseless Info` n=7 are
+too small to read. The sentence-level propagation rule is this repo's choice
+and a different rule gives a different number, which is why it travels with
+every item. Nothing here is comparable to a published RAGTruth score computed
+at response level.
+
+#### Cost
+
+0.6-0.8 items/sec on 6 CPU threads, so ~35 minutes for 1,502 items. Run in
+chunks that persist per-item results, because two attempts to score the sample
+in one process were killed for memory on a machine with ~2 GB free — the
+premise cache and batching reduced the work substantially but the models
+themselves need ~3.5 GB resident.
+
 ### Pre-dating this effort, but foundational to it
 
 **Gemini → Groq/OpenRouter migration.** `shared/llm.py`: config-driven
@@ -1037,11 +1134,16 @@ per-key rate-limit state, key-blind retry).
   graded `relevant_chunk_keys`, and an actually-frozen benchmark corpus.
   Corpus identity (W3.1) is done; see above for the open decisions blocking
   the labeling itself.
-- **Phase 4 (remainder)**: multi-premise NLI only. Everything else in Phase 4
-  is done - both planes, plane-aware persistence, premise unification and the
-  async model calls (see above). Multi-premise is blocked solely on a labeled
-  dataset good enough to choose an aggregation rule with evidence rather than
-  intuition.
+- **Phase 4 (remainder)**: premise SELECTION, redirected by the RAGTruth
+  result above. The evidence says the weak point is not aggregating over K
+  retrieved chunks but that similarity-ranked sentence selection loses
+  contradictions (Evident Conflict recall 0.542, and 11 of 26 refuted
+  sentences scored ENTAILMENT). Evaluate any fix on Evident Conflict recall
+  with precision held constant.
+- **Threshold calibration**: `STRIP_ENTAILMENT_FLOOR` was hand-picked and has
+  never been fitted. At it, the system flags half of all grounded sentences
+  (precision 0.102 with AUROC 0.727). The conformal machinery from Phase 0
+  exists to set this and can now be run against a labeled external set.
 - **Phase 5 (mostly done)**: HaluEval, FEVER and generic adapters exist
   (`eval/adapters.py` + `scripts/convert_benchmark.py`) — see above. What
   remains is **running them on real downloaded data**, which is a licensing
