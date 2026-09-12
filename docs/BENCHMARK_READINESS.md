@@ -1048,7 +1048,7 @@ Confusion: TP 81, FN 16, TN 695, **FP 710**.
 
 #### Three findings, in order of usefulness
 
-**1. The ranking works; the operating point does not.** AUROC 0.727 says the
+**1. The ranking works; the operating point does not.** *(SUPERSEDED - a threshold sweep later showed precision is flat across the whole range and the cause is a predicate mismatch, not calibration. See the correction entry below.)* AUROC 0.727 says the
 entailment score does separate hallucinated sentences from grounded ones —
 compare HaluEval QA's 0.526, which was chance. But at the shipped threshold
 the system flags **710 of 1,405 grounded sentences**, almost exactly half, for
@@ -1117,6 +1117,101 @@ in one process were killed for memory on a machine with ~2 GB free — the
 premise cache and batching reduced the work substantially but the models
 themselves need ~3.5 GB resident.
 
+### Correcting the RAGTruth interpretation — precision on this conversion is not a valid detector measure
+
+The entry above reads the low precision (0.102) as a miscalibrated operating
+point and calls the threshold "decisively" the cause. **That was wrong**, and
+four experiments were needed to establish it. Recording them because the
+negative results are worth more than the original claim.
+
+**1. Threshold calibration — no effect.** New `eval/threshold.py` sweeps the
+entailment floor while replicating the shipped `_should_strip` rule exactly
+(contradiction and missing-evidence branches fire as in production; only the
+floor varies — sweeping `score < t` alone would describe a detector this repo
+does not ship). Precision is flat at ~0.10 across the whole range:
+
+| floor | precision | recall | FP |
+|---|---|---|---|
+| 0.10 | 0.108 | 0.835 | 666 |
+| **0.50 (shipped)** | **0.102** | **0.835** | **710** |
+| 0.90 | 0.102 | 0.876 | 747 |
+
+Best achievable F1 is 0.198 against a current 0.182. There is no operating
+point worth moving to, so the threshold is not the problem.
+
+The score distributions say why. Grounded sentences the system keeps have a
+median entailment of **0.9951**; grounded sentences it flags have **0.0013**;
+genuine hallucinations have **0.0011**. The falsely-flagged grounded sentences
+and the real hallucinations are statistically indistinguishable — the score
+carries no information separating them, so no cut-off can.
+
+**2. Premise selection — not the cause either.** Hypothesis: top-3 similarity
+selection discards the supporting sentence. Two tests, both negative.
+Handing the model the whole premise made things *worse* (specificity 0.220 vs
+0.534), because NLI models are trained on sentence pairs and degrade on
+300-word premises. Raising `NLI_TOP_K` from 3 to 6 moved specificity from
+0.534 to 0.559 — three fewer false positives in 118.
+
+**3. Fragment artifacts — real bug, not the cause.** The sentence splitter was
+emitting bare list markers ("1.", "2.") as claims: 126 of 1,502 scored items,
+and 18% of all false positives. Nothing can entail "2.", so each was a
+guaranteed false positive that said nothing about the detector. Fixed
+(`_drop_list_markers`, `_strip_leading_markers` advancing `start` so
+`text[start:end] == sentence` still holds, and an `is_proposition` filter with
+`min_claim_words`, all counted in the conversion report). But excluding them
+barely moves precision — 0.102 to 0.098 — because it removes true positives in
+the same proportion.
+
+**4. The actual cause: entailment and hallucination are different predicates.**
+Tracing one false positive settles it. Claim: *"To make panko crumbs, preheat
+the oven to 300 degrees F (150 degrees C)."* The selector worked perfectly and
+handed the model *"passage 1:1 Preheat an oven to 300 degrees F (150 degrees
+C)... passage 3:Preheat the oven to 300 degrees F."* Entailment: **0.002**.
+
+The word "panko" never appears in the premise. Strict entailment is therefore
+*correct* to refuse: the evidence supports "preheat to 300F" but not the panko
+framing, which the reader supplies from the question. RAGTruth does not
+annotate this as a hallucination, because a human judges it faithful in
+context.
+
+RAGTruth marks a span hallucinated when a human reads it as fabricated. Strict
+NLI entailment requires the premise to entail every element of the claim,
+including topical framing a reader bridges for free. The second predicate is
+strictly stronger, so measuring this system's precision against RAGTruth's
+sentence labels penalizes it for being stricter than the annotation — not for
+being wrong.
+
+#### What survives, and what does not
+
+* **Not usable:** precision, F1, specificity on this conversion. They are
+  dominated by the predicate mismatch, and any of them quoted as "our
+  hallucination detector's precision" would be misleading.
+* **Usable:** recall (0.835) and AUROC (0.727-0.733) — both computed over
+  RAGTruth's annotated positives, where the two predicates agree that
+  something is wrong.
+* **Still the headline finding:** Evident Conflict recall **0.45-0.54** versus
+  0.94 for Baseless Info. Direct contradictions are caught half as often as
+  merely unsupported claims, and *that* is measured on the annotated positives
+  where the predicates do agree. It remains the one clearly actionable defect.
+
+#### The product consequence is real even though the measurement is not
+
+The benchmark cannot fairly score precision here, but the *behavior* it
+surfaced is genuine: on RAG-style content this system flags roughly half of
+all sentences, including correct ones, because strict entailment rejects
+ordinary topical bridging. A user would experience that as noise regardless of
+what any benchmark says. Softening it is a design decision — accept
+claim-level entailment against a wider premise, or gate on contradiction
+strength rather than entailment absence — not a calibration one.
+
+#### Method note
+
+Four hypotheses, three falsified, one confirmed by a single traced example.
+The three negative results are recorded because each was individually
+plausible and would otherwise be re-proposed: the threshold looks miscalibrated
+from the confusion matrix, the selector looks lossy from the top-K design, and
+the fragments look like the obvious artifact once seen.
+
 ### Pre-dating this effort, but foundational to it
 
 **Gemini → Groq/OpenRouter migration.** `shared/llm.py`: config-driven
@@ -1140,10 +1235,15 @@ per-key rate-limit state, key-blind retry).
   contradictions (Evident Conflict recall 0.542, and 11 of 26 refuted
   sentences scored ENTAILMENT). Evaluate any fix on Evident Conflict recall
   with precision held constant.
-- **Threshold calibration**: `STRIP_ENTAILMENT_FLOOR` was hand-picked and has
-  never been fitted. At it, the system flags half of all grounded sentences
-  (precision 0.102 with AUROC 0.727). The conformal machinery from Phase 0
-  exists to set this and can now be run against a labeled external set.
+- **Threshold calibration**: done and CLOSED as a non-issue. `eval/threshold.py`
+  sweeps the floor against labeled data; precision is flat at ~0.10 across the
+  entire range, so there is no operating point worth moving to. The tool stays
+  for the domain corpus, where the answer may differ.
+- **A claim-level entailment benchmark**: precision cannot be measured against
+  RAGTruth's sentence labels, because strict entailment is a stronger predicate
+  than its hallucination annotation (see the correction entry). Measuring
+  precision honestly needs either response-level evaluation as RAGTruth intends,
+  or a set annotated for entailment specifically.
 - **Phase 5 (mostly done)**: HaluEval, FEVER and generic adapters exist
   (`eval/adapters.py` + `scripts/convert_benchmark.py`) — see above. What
   remains is **running them on real downloaded data**, which is a licensing

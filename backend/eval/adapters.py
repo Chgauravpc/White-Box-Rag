@@ -358,21 +358,85 @@ RAGTRUTH_LABEL_MAP = {
 _SENTENCE_END = re.compile(r"(?<=[.!?])[\"')\]]*\s+|\n+")
 
 
-def split_sentences_with_offsets(text: str) -> list[tuple[int, int, str]]:
-    """Split into (start, end, text) triples with offsets into the original."""
+# A "sentence" consisting only of a list marker — "1.", "2)", "3." — is a
+# numbering artifact, not a claim. Generated answers are full of them, and
+# scoring them as claims is meaningless: nothing can entail "2.", so the model
+# returns NEUTRAL and the item counts as a false positive. In the first
+# RAGTruth run 126 of 1,502 scored items were bare list markers and 18% of all
+# false positives were fragments of this kind.
+_LIST_MARKER = re.compile(r"^\(?[0-9]+[.)\]]?$|^[-*•]$")
+
+
+_LEADING_MARKER = re.compile(r"^(\(?[0-9]+[.)\]]|[-*•])\s+")
+
+
+def _strip_leading_markers(spans):
+    """Remove a leading "1. " or "- " from a sentence.
+
+    `start` is advanced past the marker rather than the text being edited in
+    place, so `text[start:end] == sentence` still holds — those offsets are
+    what span overlap is computed against.
+    """
+    out = []
+    for start, end, text in spans:
+        m = _LEADING_MARKER.match(text)
+        if m:
+            start += m.end()
+            text = text[m.end():]
+        if text:
+            out.append((start, end, text))
+    return out
+
+
+def _drop_list_markers(spans):
+    """Remove bare list markers from the sentence list.
+
+    Dropped rather than merged into the following sentence: merging would have
+    to extend that sentence's start offset over the marker, breaking the
+    invariant that `text[start:end] == sentence`, and those offsets are what
+    span overlap is computed against. Dropping is safe for overlap because an
+    annotation covering "1. Remove the blue field" still overlaps the range of
+    "Remove the blue field"; only a span covering the digit alone would be
+    lost, which does not occur.
+    """
+    return [(start, end, text) for start, end, text in spans if not _LIST_MARKER.match(text)]
+
+
+def _raw_split(text: str) -> list[tuple[int, int, str]]:
+    """Sentence spans before list markers are removed."""
+    text = text or ""
     spans, pos = [], 0
-    for match in _SENTENCE_END.finditer(text or ""):
+    for match in _SENTENCE_END.finditer(text):
         end = match.start()
         chunk = text[pos:end].strip()
         if chunk:
             start = pos + (len(text[pos:end]) - len(text[pos:end].lstrip()))
             spans.append((start, start + len(chunk), chunk))
         pos = match.end()
-    tail = (text or "")[pos:].strip()
+    tail = text[pos:].strip()
     if tail:
         start = pos + (len(text[pos:]) - len(text[pos:].lstrip()))
         spans.append((start, start + len(tail), tail))
     return spans
+
+
+def split_sentences_with_offsets(text: str) -> list[tuple[int, int, str]]:
+    """(start, end, text) sentence triples, list-numbering artifacts removed.
+
+    Offsets index back into `text`, i.e. text[start:end] == sentence.
+    """
+    return _strip_leading_markers(_drop_list_markers(_raw_split(text)))
+
+
+def is_proposition(text: str, min_words: int = 4) -> bool:
+    """Whether a sentence is something an NLI model can meaningfully judge.
+
+    Entailment is a relation between propositions. A bullet fragment or a bare
+    heading is not one, so no premise can entail it and it is scored NEUTRAL
+    regardless of the evidence — a guaranteed false positive that says nothing
+    about the detector.
+    """
+    return len(re.findall(r"[A-Za-z']+", text or "")) >= min_words
 
 
 def _ragtruth_premise(source: dict) -> str:
@@ -395,6 +459,7 @@ def _ragtruth_premise(source: dict) -> str:
 
 def from_ragtruth(
     responses, sources, task_types=("QA", "Summary"), split=None, id_prefix="ragtruth",
+    min_claim_words: int = 4,
 ) -> tuple[list[dict], dict]:
     """Convert RAGTruth responses into sentence-level detector items.
 
@@ -413,6 +478,8 @@ def from_ragtruth(
         "skipped_wrong_split": 0, "skipped_wrong_task": 0,
         "skipped_no_source": 0, "skipped_no_premise": 0, "skipped_no_sentences": 0,
         "sentences_total": 0, "sentences_hallucinated": 0,
+        "skipped_list_markers": 0, "skipped_fragments": 0, "skipped_fragments_annotated": 0,
+        "min_claim_words": min_claim_words,
         "by_error_type": {},
         "propagation_rule": "sentence_overlaps_any_span",
     }
@@ -434,7 +501,9 @@ def from_ragtruth(
             continue
 
         text = response.get("response") or ""
-        sentences = split_sentences_with_offsets(text)
+        raw_sentences = _raw_split(text)
+        sentences = _strip_leading_markers(_drop_list_markers(raw_sentences))
+        report["skipped_list_markers"] += len(raw_sentences) - len(sentences)
         if not sentences:
             report["skipped_no_sentences"] += 1
             continue
@@ -444,6 +513,13 @@ def from_ragtruth(
         report["used_responses"] += 1
 
         for idx, (start, end, sentence) in enumerate(sentences):
+            if not is_proposition(sentence, min_claim_words):
+                # Counted, never silently dropped: excluding items changes what
+                # the resulting number covers.
+                report["skipped_fragments"] += 1
+                if [sp for sp in spans if sp["start"] < end and start < sp["end"]]:
+                    report["skipped_fragments_annotated"] += 1
+                continue
             # Half-open interval intersection; a span touching only the
             # boundary is not an overlap.
             hits = [s for s in spans if s["start"] < end and start < s["end"]]

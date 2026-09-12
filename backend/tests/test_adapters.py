@@ -15,7 +15,7 @@ import pytest
 
 from eval.adapters import (
     dataset_validity_report, from_fever, from_generic, from_halueval, from_ragtruth,
-    split_sentences_with_offsets, write_detector_dataset,
+    is_proposition, split_sentences_with_offsets, write_detector_dataset,
 )
 from eval.detector import run_detector_eval, validate_detector_item
 
@@ -284,7 +284,7 @@ class TestRagTruth:
 
     def test_unannotated_response_yields_all_supported(self):
         items, _ = from_ragtruth(
-            [self._response("One fact. Another fact.")], [self._source()], split="test"
+            [self._response("The reserves rose sharply. The deficit narrowed as well.")], [self._source()], split="test"
         )
         assert {i["label"] for i in items} == {"SUPPORTED"}
 
@@ -292,8 +292,8 @@ class TestRagTruth:
         """Baseless Info means absent from the context, not contradicted by it —
         that is NEI. Both are in the detector's positive class, but collapsing
         them would lose the distinction the breakdown depends on."""
-        text = "A grounded claim. An invented detail."
-        span = {"start": text.index("An invented"), "end": len(text),
+        text = "The reserves rose sharply this quarter. The chairman resigned on Tuesday."
+        span = {"start": text.index("The chairman"), "end": len(text),
                 "label_type": "Evident Baseless Info"}
         items, _ = from_ragtruth([self._response(text, [span])], [self._source()], split="test")
         assert items[1]["label"] == "NEI"
@@ -309,7 +309,7 @@ class TestRagTruth:
         assert items[0]["error_type"] == "Evident Conflict"
 
     def test_boundary_touching_span_is_not_an_overlap(self):
-        text = "First sentence. Second sentence."
+        text = "The reserves rose sharply. The deficit narrowed as well."
         end_of_first = text.index(".") + 1
         span = {"start": end_of_first, "end": len(text), "label_type": "Evident Conflict"}
         items, _ = from_ragtruth([self._response(text, [span])], [self._source()], split="test")
@@ -317,7 +317,7 @@ class TestRagTruth:
 
     def test_split_filter(self):
         items, report = from_ragtruth(
-            [self._response("A fact.", split="train")], [self._source()], split="test"
+            [self._response("The reserves rose sharply this quarter.", split="train")], [self._source()], split="test"
         )
         assert items == [] and report["skipped_wrong_split"] == 1
 
@@ -325,39 +325,112 @@ class TestRagTruth:
         """Its premise is a structured business record, not prose — an NLI
         model reading a serialized dict is doing a different task."""
         items, report = from_ragtruth(
-            [self._response("A fact.")], [self._source(task_type="Data2txt")], split="test"
+            [self._response("The reserves rose sharply this quarter.")], [self._source(task_type="Data2txt")], split="test"
         )
         assert items == [] and report["skipped_wrong_task"] == 1
 
     def test_data2txt_can_be_requested_explicitly(self):
         items, _ = from_ragtruth(
-            [self._response("A fact.")], [self._source(task_type="Data2txt")],
+            [self._response("The reserves rose sharply this quarter.")], [self._source(task_type="Data2txt")],
             task_types=("Data2txt",), split="test",
         )
         assert len(items) == 1
 
     def test_qa_premise_is_the_retrieved_passages(self):
-        items, _ = from_ragtruth([self._response("A fact.")], [self._source()], split="test")
+        items, _ = from_ragtruth([self._response("The reserves rose sharply this quarter.")], [self._source()], split="test")
         assert items[0]["premise"] == "The reserves rose to 700B."
 
     def test_summary_premise_is_the_article_string(self):
         src = {"source_id": 1, "task_type": "Summary", "source_info": "The article text."}
-        items, _ = from_ragtruth([self._response("A fact.")], [src], split="test")
+        items, _ = from_ragtruth([self._response("The reserves rose sharply this quarter.")], [src], split="test")
         assert items[0]["premise"] == "The article text."
 
     def test_missing_source_is_counted_not_fatal(self):
         items, report = from_ragtruth(
-            [self._response("A fact.", source_id=999)], [self._source()], split="test"
+            [self._response("The reserves rose sharply this quarter.", source_id=999)], [self._source()], split="test"
         )
         assert items == [] and report["skipped_no_source"] == 1
 
     def test_propagation_rule_is_recorded_on_every_item(self):
         """The rule is a methodological choice; a number is only comparable to
         someone else's if their rule matches, so it travels with the data."""
-        items, report = from_ragtruth([self._response("A fact.")], [self._source()], split="test")
+        items, report = from_ragtruth([self._response("The reserves rose sharply this quarter.")], [self._source()], split="test")
         assert report["propagation_rule"] == "sentence_overlaps_any_span"
         assert all(i["propagation_rule"] == "sentence_overlaps_any_span" for i in items)
 
     def test_items_are_valid_detector_items(self):
-        items, _ = from_ragtruth([self._response("A fact. Another.")], [self._source()], split="test")
+        items, _ = from_ragtruth([self._response("The reserves rose sharply. The deficit narrowed as well.")], [self._source()], split="test")
         assert all(validate_detector_item(i) == [] for i in items)
+
+
+class TestFragmentHandling:
+    """Written after the first real RAGTruth run, where 126 of 1,502 scored
+    items were bare list markers ("1.", "2.") and 18% of all false positives
+    were fragments of that kind. Nothing can entail "2.", so the model returns
+    NEUTRAL and the item is a guaranteed false positive that says nothing
+    about the detector."""
+
+    def test_list_markers_are_not_scored_as_sentences(self):
+        text = "Steps:\n1. Remove the field.\n2. Fold it twice."
+        assert [s for _, _, s in split_sentences_with_offsets(text)] == [
+            "Steps:", "Remove the field.", "Fold it twice."
+        ]
+
+    def test_dropping_markers_preserves_the_offset_invariant(self):
+        """Offsets are what span overlap is computed against, so they must
+        still index back into the original text."""
+        text = "Intro.\n1. First step here.\n2. Second step here."
+        for start, end, sent in split_sentences_with_offsets(text):
+            assert text[start:end] == sent
+
+    def test_annotation_over_a_numbered_item_still_overlaps_its_sentence(self):
+        text = "1. The reserves fell to zero."
+        span = {"start": 0, "end": len(text), "label_type": "Evident Conflict"}
+        items, _ = from_ragtruth(
+            [{"id": 1, "source_id": 1, "split": "test", "response": text, "labels": [span]}],
+            [{"source_id": 1, "task_type": "Summary", "source_info": "Reserves rose."}],
+            split="test",
+        )
+        assert [i["label"] for i in items] == ["REFUTED"]
+
+    def test_bullet_markers_are_dropped_too(self):
+        assert [s for _, _, s in split_sentences_with_offsets("* First point here.")] == [
+            "First point here."
+        ]
+
+    def test_is_proposition_rejects_fragments(self):
+        assert not is_proposition("2.")
+        assert not is_proposition("Yes.")
+        assert is_proposition("The revenue rose sharply last year.")
+
+    def test_fragments_are_excluded_and_counted(self):
+        text = "Ok.\nThe revenue rose sharply last year."
+        items, report = from_ragtruth(
+            [{"id": 1, "source_id": 1, "split": "test", "response": text, "labels": []}],
+            [{"source_id": 1, "task_type": "Summary", "source_info": "Revenue rose."}],
+            split="test",
+        )
+        assert len(items) == 1
+        assert report["skipped_fragments"] == 1
+        assert report["min_claim_words"] == 4
+
+    def test_dropping_an_annotated_fragment_is_reported(self):
+        """Excluding items changes what the number covers; if a real positive
+        is dropped that must be visible, not silent."""
+        text = "Nope.\nA properly formed sentence about the subject."
+        span = {"start": 0, "end": 5, "label_type": "Evident Conflict"}
+        _, report = from_ragtruth(
+            [{"id": 1, "source_id": 1, "split": "test", "response": text, "labels": [span]}],
+            [{"source_id": 1, "task_type": "Summary", "source_info": "x"}],
+            split="test",
+        )
+        assert report["skipped_fragments_annotated"] == 1
+
+    def test_min_claim_words_is_configurable(self):
+        text = "Two words.\nA properly formed sentence about the subject."
+        items, _ = from_ragtruth(
+            [{"id": 1, "source_id": 1, "split": "test", "response": text, "labels": []}],
+            [{"source_id": 1, "task_type": "Summary", "source_info": "x"}],
+            split="test", min_claim_words=1,
+        )
+        assert len(items) == 2
