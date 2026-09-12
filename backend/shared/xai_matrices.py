@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import threading
+from collections import OrderedDict
 import numpy as np
 import spacy
 from sentence_transformers import SentenceTransformer, CrossEncoder
@@ -110,6 +111,51 @@ MIN_ATTRIBUTION_SCORE  = config.MIN_ATTRIBUTION_SCORE
 AMBIGUITY_GAP_THRESHOLD = config.AMBIGUITY_GAP_THRESHOLD
 WEAK_ATTRIBUTION_SCORE  = config.WEAK_ATTRIBUTION_SCORE
 
+# Sentence-splitting and embedding a premise is the expensive half of premise
+# preparation: a spaCy parse plus one bge-large forward pass per sentence. The
+# same premise is very often prepared many times in a row — every claim from
+# one generated answer shares its source chunk, and every sentence of one
+# benchmark response shares its evidence. On a RAGTruth sample that was 1,502
+# preparations over 175 distinct premises, i.e. ~8.6x of the work was
+# recomputation, and holding all of it at once is what exhausted memory.
+#
+# Bounded LRU rather than an unbounded dict: this is a long-lived process and
+# an unbounded cache keyed on document text is a memory leak with extra steps.
+_SENTENCE_CACHE: "OrderedDict[str, tuple]" = OrderedDict()
+_SENTENCE_CACHE_LOCK = threading.Lock()
+
+
+def _split_and_embed(clean_passage: str):
+    """(sentences, unit-normalized embeddings) for a premise, memoized."""
+    with _SENTENCE_CACHE_LOCK:
+        hit = _SENTENCE_CACHE.get(clean_passage)
+        if hit is not None:
+            _SENTENCE_CACHE.move_to_end(clean_passage)
+            return hit
+
+    doc = _spacy_nlp(clean_passage)
+    sentences = [s.text.strip() for s in doc.sents if len(s.text.strip()) > MIN_SENTENCE_LEN]
+    if len(sentences) > NLI_TOP_K:
+        embs = _encoder.encode(sentences)
+        embs = embs / np.linalg.norm(embs, axis=1, keepdims=True)
+    else:
+        embs = None  # no ranking needed; don't pay for embeddings
+    value = (sentences, embs)
+
+    with _SENTENCE_CACHE_LOCK:
+        _SENTENCE_CACHE[clean_passage] = value
+        while len(_SENTENCE_CACHE) > config.PREMISE_CACHE_SIZE:
+            _SENTENCE_CACHE.popitem(last=False)
+    return value
+
+
+def clear_premise_cache():
+    """Drop the memoized premise sentences/embeddings (tests, and any caller
+    that has just changed the active profile or embedding model)."""
+    with _SENTENCE_CACHE_LOCK:
+        _SENTENCE_CACHE.clear()
+
+
 def extract_relevant_sentences(claim, passage, profile=None):
     """Extract top-K prose sentences most similar to the claim.
 
@@ -119,16 +165,13 @@ def extract_relevant_sentences(claim, passage, profile=None):
     get consistent behavior.
     """
     clean_passage, _ = normalize_premise(passage, profile or PREMISE_NORMALIZER)
-    doc = _spacy_nlp(clean_passage)
-    sentences = [s.text.strip() for s in doc.sents if len(s.text.strip()) > MIN_SENTENCE_LEN]
+    sentences, sent_norm = _split_and_embed(clean_passage)
     if not sentences:
         return clean_passage[:800] if clean_passage else passage[:800]
     if len(sentences) <= NLI_TOP_K:
         return " ".join(sentences)
     claim_emb  = _encoder.encode([claim])
-    sent_embs  = _encoder.encode(sentences)
-    claim_norm = claim_emb  / np.linalg.norm(claim_emb)
-    sent_norm  = sent_embs  / np.linalg.norm(sent_embs, axis=1, keepdims=True)
+    claim_norm = claim_emb / np.linalg.norm(claim_emb)
     scores     = (claim_norm @ sent_norm.T).squeeze()
     if np.ndim(scores) == 0:
         return sentences[0]

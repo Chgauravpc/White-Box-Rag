@@ -229,3 +229,58 @@ class TestShippedSmokeDataset:
         items, _ = load_detector_dataset(self._path())
         ids = [i["id"] for i in items]
         assert len(ids) == len(set(ids))
+
+
+class TestBatching:
+    """Scoring a whole benchmark in one call materialized every premise's
+    tokenized pairs and sentence embeddings at once; on a 1,502-item RAGTruth
+    sample that exhausted memory and the process was killed."""
+
+    def _items(self, n):
+        return [{"id": f"i{k}", "claim": f"claim {k}", "premise": f"premise {k}",
+                 "label": "SUPPORTS"} for k in range(n)]
+
+    def test_batching_does_not_change_results(self, monkeypatch):
+        import numpy as np
+        import shared.xai_matrices as xm
+        monkeypatch.setattr(
+            xm._nli, "predict",
+            lambda pairs, **kw: np.array([[0.0, 1.0, 0.0]] * len(pairs), dtype="float32"),
+        )
+        items = self._items(20)
+        one = run_detector_eval(items, batch_size=1000)
+        many = run_detector_eval(items, batch_size=3)
+        assert [i["id"] for i in one["per_item"]] == [i["id"] for i in many["per_item"]]
+        assert one["metrics"]["precision"]["value"] == many["metrics"]["precision"]["value"]
+
+    def test_every_item_is_scored_when_batches_do_not_divide_evenly(self):
+        out = run_detector_eval(self._items(7), batch_size=3)
+        assert out["n"] == 7 and len(out["per_item"]) == 7
+
+    def test_batch_size_is_clamped_to_at_least_one(self):
+        out = run_detector_eval(self._items(3), batch_size=0)
+        assert out["n"] == 3
+
+
+class TestPremiseCache:
+    def test_repeated_premise_is_only_prepared_once(self, monkeypatch):
+        """The RAGTruth shape: every sentence of one response shares its
+        evidence, so the same premise was split and embedded once per claim."""
+        import shared.xai_matrices as xm
+
+        xm.clear_premise_cache()
+        parses = []
+        real = xm._spacy_nlp
+        monkeypatch.setattr(xm, "_spacy_nlp", lambda t: (parses.append(t), real(t))[1])
+
+        long_premise = " ".join(f"Sentence number {i} about the subject matter." for i in range(40))
+        run_detector_eval([
+            {"id": f"i{k}", "claim": f"claim {k}", "premise": long_premise, "label": "SUPPORTS"}
+            for k in range(5)
+        ])
+        assert len(parses) == 1, f"premise was re-parsed {len(parses)} times"
+
+    def test_cache_can_be_cleared(self):
+        import shared.xai_matrices as xm
+        xm.clear_premise_cache()
+        assert len(xm._SENTENCE_CACHE) == 0

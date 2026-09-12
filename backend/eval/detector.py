@@ -111,11 +111,21 @@ def load_detector_dataset(path: str) -> tuple[list[dict], dict]:
     return items, errors_by_id
 
 
-def run_detector_eval(items: list[dict], profile: str = "none") -> dict:
+# Scoring a whole benchmark in one call materializes every premise's tokenized
+# pairs and sentence embeddings simultaneously. On a 1,502-item RAGTruth
+# sample (median premise 327 words) that exhausted memory and the process was
+# killed. Items are therefore scored in bounded batches; results are identical
+# either way, since each pair is independent.
+DEFAULT_BATCH_SIZE = 64
+
+
+def run_detector_eval(items: list[dict], profile: str = "none",
+                      batch_size: int = DEFAULT_BATCH_SIZE) -> dict:
     """Score the claim-verification stage against per-claim labels.
 
     Pure: no LLM, no retrieval, no database. `profile` is the premise
-    normalizer; leave it at "none" for external benchmarks.
+    normalizer; leave it at "none" for external benchmarks. `batch_size`
+    bounds peak memory — see DEFAULT_BATCH_SIZE.
     """
     if not items:
         return {
@@ -126,7 +136,15 @@ def run_detector_eval(items: list[dict], profile: str = "none") -> dict:
             "per_item": [],
         }
 
-    raw = verify_claims_batch([(it["claim"], it.get("premise", "")) for it in items], profile=profile)
+    batch_size = max(1, int(batch_size))
+    raw = []
+    for start in range(0, len(items), batch_size):
+        chunk = items[start:start + batch_size]
+        raw.extend(verify_claims_batch(
+            [(it["claim"], it.get("premise", "")) for it in chunk], profile=profile
+        ))
+        if start and start % (batch_size * 20) == 0:
+            logger.info("detector plane: %d/%d items scored", start, len(items))
 
     y_true, y_pred, scores_, error_types, per_item = [], [], [], [], []
     verdict_confusion: dict[str, dict[str, int]] = {}
@@ -179,9 +197,10 @@ def run_detector_eval(items: list[dict], profile: str = "none") -> dict:
     }
 
 
-def run_detector_eval_from_file(path: str, profile: str = "none") -> dict:
+def run_detector_eval_from_file(path: str, profile: str = "none",
+                                batch_size: int = DEFAULT_BATCH_SIZE) -> dict:
     items, errors_by_id = load_detector_dataset(path)
-    result = run_detector_eval(items, profile=profile)
+    result = run_detector_eval(items, profile=profile, batch_size=batch_size)
     result["dataset_path"] = path
     result["skipped_items"] = errors_by_id
     return result

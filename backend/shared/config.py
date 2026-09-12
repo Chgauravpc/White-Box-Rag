@@ -81,6 +81,11 @@ CORPORA_PATH = _env_str("CORPORA_PATH", "./data/corpora")
 MAX_COLLECTION_LABEL_LENGTH = _env_int("MAX_COLLECTION_LABEL_LENGTH", 64)
 
 # ---------- Chunking Defaults ----------
+# How many distinct premises keep their split sentences and embeddings
+# memoized (shared/xai_matrices.py). Bounds the cost of re-preparing the
+# same evidence for every claim that cites it.
+PREMISE_CACHE_SIZE = _env_int("PREMISE_CACHE_SIZE", 256)
+
 CHUNK_MAX_TOKENS = _env_int("CHUNK_MAX_TOKENS", 512)
 CHUNK_OVERLAP_TOKENS = _env_int("CHUNK_OVERLAP_TOKENS", 50)
 
