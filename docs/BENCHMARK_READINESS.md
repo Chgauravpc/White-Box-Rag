@@ -28,7 +28,7 @@ why a change happened.
 | **1** ✅ | Scoring & provenance core — a real label-vs-prediction scorer; run durability |
 | **2** ✅ | Multi-provider (Groq **+** OpenRouter) API key pool |
 | **3** 🟡 | Dataset scale-up — hundreds of labeled items, graded retrieval ground truth (W3.1 corpus identity ✅; labeling not started) |
-| **4** 🟡 | Evaluation planes (retrieval / detector / end-to-end) + NLI multi-premise + domain-neutral normalization (W4.3 done, empty-premise guard done; planes + multi-premise open) |
+| **4** 🟡 | Evaluation planes (all three done), NLI verdict integrity, premise unification, async model calls, plane persistence - only multi-premise NLI remains |
 | **5** 🟡 | External benchmark adapters (HaluEval/FEVER/generic converters done; RAGTruth + BEIR open; needs real data) |
 | **6** | Ablation & baseline comparison (plain-RAG vs. full governance) |
 | **7** | CLI entrypoints + two-tier CI (fast offline / nightly live) |
@@ -926,6 +926,100 @@ makes no LLM calls, so the only cost is CPU time.
 **Tests:** 5 validity cases in `tests/test_adapters.py`. 381 tests pass
 (was 376).
 
+### Phase 4 (completed) — premise unification, async model calls, plane persistence
+
+Three items that were known, recorded and deferred are now done.
+
+#### One premise preparation, not three
+
+`verify_claims_batch`, `build_entailment_matrix` and `stability.py` each
+prepared NLI premises independently, and disagreed for the same
+(claim, passage) pair in four ways:
+
+* the matrix applied the `NLI_PREPROCESS_AT` word-count threshold to the
+  **raw** passage while verification applied it to the **normalized** one, so
+  a passage could be sentence-focused on one path and not the other;
+* below that threshold the matrix fed the **raw** passage and verification the
+  **normalized** one;
+* the matrix never received the caller's profile, so it always used the config
+  default even when the caller asked for `none` — which is exactly what the
+  detector plane passes for external benchmarks;
+* the matrix had no empty-premise guard, so it still sent `("", claim)` to the
+  model, reintroducing the fabricated-softmax bug on the XAI path after it had
+  been fixed on the verdict path.
+
+The visible consequence: **the entailment matrix rendered in the UI could
+contradict the verdict displayed beside it**, because the two numbers were
+computed from different premise text. `stability.py` was a third variant again
+— it skipped normalization entirely and thresholded on raw text.
+
+All three now call `xai_matrices.prepare_premise(claim, raw_passage, profile)`,
+which returns `(focused_text, deleted_lines, evidence_status)`. The regression
+test asserts the two paths send byte-identical text to the model, using a
+premise containing a `3 | P a g e` marker that the generic normalizer deletes
+outright — so the old paths differed in content, not merely whitespace, and
+the test genuinely fails against the old behavior.
+
+#### Model calls off the event loop
+
+Every NLI and embedding call is synchronous, and they are invoked from
+`async def` functions. A CrossEncoder forward pass therefore blocked the event
+loop: under `EVAL_CONCURRENCY` each item's NLI batch stalled every other
+in-flight item's LLM HTTP calls, so raising concurrency bought much less than
+it appeared to. There was no `to_thread` or `run_in_executor` anywhere in
+`backend/`.
+
+New `averify_claims_batch`, `abuild_entailment_matrix` and `anli_predict` wrap
+the synchronous functions in `asyncio.to_thread`; `nli_engine` and
+`stability.py` use them. The work is guarded by a module-level
+`threading.RLock`, and that is not optional: `_encoder` and `_nli` are single
+shared torch modules, and running `predict()` on one from several threads at
+once multiplies peak memory by the thread count. `RLock` rather than `Lock`
+because the guarded functions call each other (`verify_claims_batch` →
+`extract_relevant_sentences` both touch the models) and a plain lock would
+deadlock on re-entry. Deliberately a threading primitive rather than an
+`asyncio.Semaphore`, which binds to the event loop that first awaits it and
+breaks the moment a second loop appears — which every `asyncio.run` in the
+test suite creates.
+
+#### Deterministic test fakes
+
+`conftest.py`'s ML fakes returned `np.random.rand(...)`, so every assertion
+about a verdict, a similarity ranking or a score distribution depended on the
+global RNG. A test could pass or fail run to run, and a genuine regression was
+indistinguishable from an unlucky draw — which also made it impossible to
+assert anything about aggregation behavior, a prerequisite for the
+multi-premise work.
+
+The fakes are now seeded from a SHA-256 of their input, so identical input
+always produces identical output, and cosine similarity between two texts is a
+stable number. SHA-256 rather than Python's `hash()`, which is salted per
+process: a `hash()`-seeded fake would be stable within a run and different
+across runs, the worst of both worlds. Verified identical across separate
+processes.
+
+#### Plane-aware persistence
+
+The three planes report incompatible metric shapes — end-to-end has
+faithfulness and trust statuses, detector has AUROC over claim labels,
+retrieval has nDCG over chunk labels. `eval_runs` gained a `plane` column
+(existing rows backfilled to `end_to_end`), and the detector and retrieval
+endpoints now persist their runs through the same create-before/finalize-after
+durability pattern `POST /run` uses, so a crash leaves a diagnosable `failed`
+row rather than silence.
+
+Two consequences worth stating. `run_eval(..., resume_from_run_id=...)` now
+**refuses** to resume a non-end-to-end run — continuing a detector run under
+the end-to-end harness would merge two different measurements into one
+aggregate that describes neither. And the Streamlit trend charts filter to
+end-to-end runs only: plotting a detector run into a faithfulness series would
+draw a gap and imply a regression where there is only a different kind of run.
+Non-end-to-end runs are labelled in the run history and render their own
+metrics rather than end-to-end fields as zeros.
+
+**Tests:** `tests/test_eval_planes.py` (8) plus 5 premise-consistency cases in
+`tests/test_nli_policy.py`. 394 tests pass (was 381).
+
 ### Pre-dating this effort, but foundational to it
 
 **Gemini → Groq/OpenRouter migration.** `shared/llm.py`: config-driven
@@ -943,11 +1037,11 @@ per-key rate-limit state, key-blind retry).
   graded `relevant_chunk_keys`, and an actually-frozen benchmark corpus.
   Corpus identity (W3.1) is done; see above for the open decisions blocking
   the labeling itself.
-- **Phase 4 (remainder)**: plane-aware persistence in `eval_runs` (a `plane`
-  column plus a per-plane metric envelope) and multi-premise NLI. The
-  **detector and retrieval planes are both done** - see above. Multi-premise
-  is no longer blocked on machinery, since the detector plane can score both
-  arms; it is blocked only on a labeled dataset to score them with.
+- **Phase 4 (remainder)**: multi-premise NLI only. Everything else in Phase 4
+  is done - both planes, plane-aware persistence, premise unification and the
+  async model calls (see above). Multi-premise is blocked solely on a labeled
+  dataset good enough to choose an aggregation rule with evidence rather than
+  intuition.
 - **Phase 5 (mostly done)**: HaluEval, FEVER and generic adapters exist
   (`eval/adapters.py` + `scripts/convert_benchmark.py`) — see above. What
   remains is **running them on real downloaded data**, which is a licensing

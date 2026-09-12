@@ -252,3 +252,90 @@ class TestNliLabelOrder:
         import shared.xai_matrices as xm
         monkeypatch.setattr(xm, "ENTAILMENT_IDX", 2)
         assert xm.entailment_score_of([0.1, 0.2, 0.7]) == 0.7
+
+
+class TestPremiseConsistency:
+    """The verdict and the XAI entailment matrix must be computed from the
+    SAME premise text for the same (claim, passage) pair.
+
+    They were not. `build_entailment_matrix` applied the NLI_PREPROCESS_AT
+    word-count threshold to the RAW passage while `verify_claims_batch`
+    applied it to the NORMALIZED one; below that threshold the matrix fed the
+    raw passage and verification the normalized one; the matrix never received
+    the caller's profile; and the matrix had no empty-premise guard. So the
+    matrix rendered in the UI could contradict the verdict beside it.
+    """
+
+    def test_both_paths_send_identical_text_to_the_model(self, monkeypatch):
+        import numpy as np
+        import shared.xai_matrices as xm
+
+        seen = []
+
+        def _spy(pairs, **kw):
+            seen.extend(pairs)
+            return np.array([[0.0, 1.0, 0.0]] * len(pairs), dtype="float32")
+
+        monkeypatch.setattr(xm._nli, "predict", _spy)
+        claim = "Reserves rose."
+        # "3 | P a g e" is a PDF page-marker artifact the generic normalizer
+        # deletes outright, so the raw and normalized premises differ in
+        # content, not merely in whitespace.
+        passage = "3 | P a g e\nForeign exchange reserves increased sharply during the quarter."
+
+        seen.clear()
+        xm.verify_claims_batch([(claim, passage)])
+        verify_premise = seen[0][0]
+
+        seen.clear()
+        xm.build_entailment_matrix([claim], [passage])
+        matrix_premise = seen[0][0]
+
+        assert verify_premise == matrix_premise
+
+    def test_profile_is_honoured_by_the_matrix(self, monkeypatch):
+        """The matrix ignored the caller's profile and always used the config
+        default — so the detector plane's profile="none" silently did not
+        apply to the matrix."""
+        import shared.xai_matrices as xm
+
+        calls = []
+        real = xm.normalize_premise
+        monkeypatch.setattr(
+            xm, "normalize_premise",
+            lambda text, profile: (calls.append(profile), real(text, profile))[1],
+        )
+        xm.build_entailment_matrix(["c"], ["a passage"], profile="none")
+        assert calls and all(p == "none" for p in calls)
+
+    def test_matrix_does_not_score_an_empty_premise(self, monkeypatch):
+        import shared.xai_matrices as xm
+
+        def _boom(pairs, **kw):
+            raise AssertionError("empty premise must not reach the model")
+
+        monkeypatch.setattr(xm._nli, "predict", _boom)
+        scores, labels = xm.build_entailment_matrix(["a claim"], [""])
+        assert scores.shape == (1, 1, 3)
+        assert scores.sum() == 0.0
+
+    def test_matrix_still_scores_the_populated_cells(self, monkeypatch):
+        """Skipping empty-premise cells must not shift the others."""
+        import numpy as np
+        import shared.xai_matrices as xm
+
+        monkeypatch.setattr(
+            xm._nli, "predict",
+            lambda pairs, **kw: np.array([[0.0, 1.0, 0.0]] * len(pairs), dtype="float32"),
+        )
+        scores, _ = xm.build_entailment_matrix(["c1"], ["", "a real passage", ""])
+        assert scores[0, 0].sum() == 0.0
+        assert scores[0, 1][xm.ENTAILMENT_IDX] == 1.0
+        assert scores[0, 2].sum() == 0.0
+
+    def test_prepare_premise_reports_status(self):
+        import shared.xai_matrices as xm
+
+        _, _, ok = xm.prepare_premise("c", "A genuine supporting passage.")
+        _, _, empty = xm.prepare_premise("c", "")
+        assert ok == "ok" and empty == "no_premise"

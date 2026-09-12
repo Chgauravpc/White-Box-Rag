@@ -406,7 +406,22 @@ async def run_eval(
 
     prior_results = []
     if resume_from_run_id is not None:
-        from shared.database import get_completed_item_ids, list_eval_items
+        from shared.database import get_completed_item_ids, get_eval_run, list_eval_items
+
+        # A run may only be resumed as its own plane. The planes report
+        # incompatible metric shapes, so continuing a detector run under the
+        # end-to-end harness would merge two different measurements into one
+        # row and produce an aggregate that describes neither.
+        prior = get_eval_run(resume_from_run_id)
+        if prior is None:
+            raise ValueError(f"Cannot resume run {resume_from_run_id}: no such run")
+        prior_plane = prior.get("plane") or "end_to_end"
+        if prior_plane != "end_to_end":
+            raise ValueError(
+                f"Cannot resume run {resume_from_run_id}: it is a '{prior_plane}' run, "
+                f"and run_eval only continues end-to-end runs"
+            )
+
         completed_ids = get_completed_item_ids(resume_from_run_id)
         if completed_ids:
             items = [item for item in items if str(item.get("id")) not in completed_ids]

@@ -2,6 +2,7 @@
 conftest.py -- Root pytest configuration.
 Mocks ML models BEFORE any backend module imports them at module level.
 """
+import hashlib
 import os
 import sys
 import tempfile
@@ -20,13 +21,35 @@ os.environ["GROQ_API_KEY"] = "test-key-not-used"
 
 # ── Fake ML models ────────────────────────────────────────────────────────────
 
+# These fakes are DETERMINISTIC: the same input always produces the same
+# output. They used to return np.random.rand(...), which made every assertion
+# about a verdict, a similarity ranking or a score distribution depend on the
+# global RNG — a test could pass or fail run to run, and a genuine regression
+# was indistinguishable from a bad draw. Anything asserting on model output
+# needs a stable function, not merely a plausible one.
+#
+# The seed is a SHA-256 of the input text, not Python's hash(): str hashing is
+# salted per process, so hash()-seeded fakes would be stable within one run and
+# different across runs — the worst of both worlds.
+
+def _seed_from(*parts) -> int:
+    digest = hashlib.sha256("|~|".join(str(p) for p in parts).encode("utf-8")).digest()
+    return int.from_bytes(digest[:4], "big")
+
+
 def _make_encoder(dim=1024):
     enc = MagicMock()
     def _encode(texts, **kw):
         if isinstance(texts, str):
             texts = [texts]
-        n = len(texts) if hasattr(texts, "__len__") else 1
-        return np.random.rand(n, dim).astype("float32")
+        texts = list(texts)
+        # Per-text seeding, so identical strings embed identically and
+        # cosine similarity between two texts is a stable, reproducible number.
+        out = np.stack([
+            np.random.RandomState(_seed_from("encode", t)).rand(dim).astype("float32")
+            for t in texts
+        ]) if texts else np.zeros((0, dim), dtype="float32")
+        return out
     enc.encode.side_effect = _encode
     return enc
 
@@ -34,9 +57,17 @@ def _make_encoder(dim=1024):
 def _make_nli():
     nli = MagicMock()
     def _predict(pairs, apply_softmax=True, **kw):
-        n = len(pairs)
-        raw = np.abs(np.random.rand(n, 3)).astype("float32")
-        return raw / raw.sum(axis=1, keepdims=True)
+        pairs = list(pairs)
+        if not pairs:
+            return np.zeros((0, 3), dtype="float32")
+        rows = []
+        for pair in pairs:
+            premise, hypothesis = (pair if isinstance(pair, (tuple, list)) and len(pair) == 2
+                                   else (pair, ""))
+            raw = np.abs(np.random.RandomState(
+                _seed_from("nli", premise, hypothesis)).rand(3)).astype("float32")
+            rows.append(raw / raw.sum())
+        return np.stack(rows)
     nli.predict.side_effect = _predict
     return nli
 

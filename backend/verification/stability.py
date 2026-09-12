@@ -20,7 +20,7 @@ from typing import List
 
 from shared import config
 from shared.models import Claim, TrustStatus
-from shared.xai_matrices import get_nli, extract_relevant_sentences, entailment_score_of, NLI_PREPROCESS_AT
+from shared.xai_matrices import anli_predict, entailment_score_of, prepare_premise
 
 logger = logging.getLogger(__name__)
 
@@ -54,18 +54,24 @@ async def compute_paraphrase_stability(
     if not second_answer:
         return 1.0, "Skipped — second sample was empty"
 
-    nli = get_nli()
+    # Premise preparation goes through the same prepare_premise() the verdict
+    # and the XAI matrix use, rather than a third independent copy of the
+    # normalize/focus logic — this used to skip normalization entirely and
+    # apply the length threshold to the raw text.
     pairs = []
     for c in retained_claims:
-        passage = second_answer
-        if len(passage.split()) > NLI_PREPROCESS_AT:
-            passage = extract_relevant_sentences(c.text, passage)
-        pairs.append((passage, c.text))
+        focused, _deleted, status = prepare_premise(c.text, second_answer)
+        if status == "ok":
+            pairs.append((focused, c.text))
 
-    # Index order comes from the active checkpoint, not a hardcoded assumption
-    # (shared/xai_matrices.py::NLI_LABELS) — a different NLI_MODEL can emit a
-    # different order, which would silently read "neutral" as "entailment".
-    scores = nli.predict(pairs, apply_softmax=True)
+    if not pairs:
+        return 1.0, "Skipped — second sample had no usable premise"
+
+    # Off the event loop, and index order comes from the active checkpoint
+    # rather than a hardcoded assumption (shared/xai_matrices.py::NLI_LABELS):
+    # a different NLI_MODEL can emit a different order, which would silently
+    # read "neutral" as "entailment".
+    scores = await anli_predict(pairs, apply_softmax=True)
     entailment_scores = [entailment_score_of(s) for s in scores]
     stability = round(sum(entailment_scores) / len(entailment_scores), 6)
 

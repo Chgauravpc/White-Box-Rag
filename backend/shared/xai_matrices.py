@@ -1,6 +1,8 @@
 """xai_matrices.py - Pure Mathematical XAI Matrix Computations. LLM extracts, Math judges."""
 
+import asyncio
 import logging
+import threading
 import numpy as np
 import spacy
 from sentence_transformers import SentenceTransformer, CrossEncoder
@@ -151,15 +153,81 @@ def build_retrieval_similarity_matrix(query, chunks):
     ]
     return chunk_ids, [float(x) for x in S]
 
-def build_entailment_matrix(claims, passages):
+def prepare_premise(claim, raw_passage, profile=None):
+    """Turn a raw passage into the exact text the NLI model will see.
+
+    THE single place premise preparation happens. `verify_claims_batch` and
+    `build_entailment_matrix` used to do this independently and disagreed four
+    ways for the same (claim, passage) pair:
+
+      * the matrix applied the `NLI_PREPROCESS_AT` word-count threshold to the
+        RAW passage, while verification applied it to the NORMALIZED one, so a
+        passage could be sentence-focused on one path and not the other;
+      * below that threshold the matrix fed the RAW passage and verification
+        fed the NORMALIZED one;
+      * the matrix never received the caller's profile, so it always used the
+        config default even when the caller asked for "none" (which is what
+        the detector plane passes for external benchmarks);
+      * the matrix had no empty-premise guard, so it still sent ("", claim) to
+        the model.
+
+    The visible consequence: the entailment matrix rendered in the UI could
+    contradict the verdict displayed next to it, because the two numbers came
+    from different premise text.
+
+    Returns (focused_text, deleted_lines, evidence_status), where
+    evidence_status is "ok" / "no_premise" / "normalizer_deleted_all".
+    """
+    profile = profile or PREMISE_NORMALIZER
+    stripped, deleted = normalize_premise(raw_passage, profile) if raw_passage else ("", [])
+
+    if stripped and len(stripped.split()) > NLI_PREPROCESS_AT:
+        focused = extract_relevant_sentences(claim, stripped, profile=profile)
+    else:
+        focused = stripped  # already short enough; no sentence selection needed
+
+    if focused.strip():
+        return focused, deleted, "ok"
+
+    if raw_passage and raw_passage.strip():
+        # A passage existed and normalization consumed all of it — a normalizer
+        # misconfiguration (e.g. the financial_reports profile on a
+        # non-financial corpus), not a property of the claim.
+        logger.warning(
+            "PREMISE_NORMALIZER '%s' deleted the entire premise for claim %r "
+            "(%d lines removed) — claim cannot be verified.",
+            profile, str(claim)[:80], len(deleted),
+        )
+        return focused, deleted, "normalizer_deleted_all"
+    return focused, deleted, "no_premise"
+
+
+def build_entailment_matrix(claims, passages, profile=None):
+    """The (claims x passages x 3) probability cube the XAI view renders.
+
+    Premise preparation goes through `prepare_premise`, the same function
+    `verify_claims_batch` uses, so a cell of this matrix and the verdict shown
+    beside it are computed from identical premise text. Cells whose premise is
+    empty are left as zeros rather than being scored — an empty premise
+    produces a well-formed but meaningless softmax.
+    """
     if not claims or not passages:
         return np.array([]), list(NLI_LABELS)
-    pairs = [
-        (extract_relevant_sentences(claim, passage) if len(passage.split()) > NLI_PREPROCESS_AT else passage, claim)
-        for claim in claims for passage in passages
-    ]
-    raw_scores = _nli.predict(pairs, apply_softmax=True)
-    return raw_scores.reshape(len(claims), len(passages), 3), list(NLI_LABELS)
+
+    pairs, positions = [], []
+    scores = np.zeros((len(claims), len(passages), 3), dtype="float32")
+    for i, claim in enumerate(claims):
+        for j, passage in enumerate(passages):
+            focused, _deleted, status = prepare_premise(claim, passage, profile=profile)
+            if status == "ok":
+                pairs.append((focused, claim))
+                positions.append((i, j))
+
+    if pairs:
+        raw = _nli.predict(pairs, apply_softmax=True)
+        for (i, j), triplet in zip(positions, raw):
+            scores[i, j] = triplet
+    return scores, list(NLI_LABELS)
 
 def verify_claims_batch(claims_with_passages, profile=None):
     if not claims_with_passages:
@@ -170,38 +238,11 @@ def verify_claims_batch(claims_with_passages, profile=None):
     premise_deletions = []
     evidence_statuses = []
     for claim, raw_passage in claims_with_passages:
-        # Always normalize first — even short passages may contain PDF artifacts
-        # (or, under "financial_reports", table rows). Deletions are recorded per
-        # claim so premise mutation is auditable rather than invisible.
-        stripped, deleted = normalize_premise(raw_passage, profile) if raw_passage else ("", [])
-        if stripped and len(stripped.split()) > NLI_PREPROCESS_AT:
-            focused = extract_relevant_sentences(claim, stripped, profile=profile)
-        else:
-            focused = stripped  # already clean; no sentence selection needed
-
-        # An empty premise must never reach the model. A CrossEncoder handed
-        # ("", claim) still returns a normalized 3-way softmax, so a claim with
-        # NO evidence used to receive a real-looking verdict and confidence —
-        # the single worst failure mode available to a hallucination detector,
-        # because the fabricated score is indistinguishable downstream from a
-        # measured one.
-        if not focused.strip():
-            if raw_passage and raw_passage.strip():
-                # A passage existed and normalization consumed all of it. That
-                # is a normalizer misconfiguration (e.g. the financial_reports
-                # profile applied to a non-financial corpus), not a property of
-                # the claim — say so loudly rather than silently returning NEI.
-                status = "normalizer_deleted_all"
-                logger.warning(
-                    "PREMISE_NORMALIZER '%s' deleted the entire premise for claim %r "
-                    "(%d lines removed) — claim cannot be verified.",
-                    profile, claim[:80], len(deleted),
-                )
-            else:
-                status = "no_premise"
-        else:
-            status = "ok"
-
+        # Premise preparation — including the empty-premise guard — lives in
+        # prepare_premise(), which build_entailment_matrix also calls, so the
+        # verdict and the XAI matrix cell for the same (claim, passage) can no
+        # longer be computed from different text.
+        focused, deleted, status = prepare_premise(claim, raw_passage, profile=profile)
         evidence_statuses.append(status)
         focused_passages.append(focused)
         premise_deletions.append(deleted)
@@ -444,3 +485,44 @@ def find_related_queries(query, stored_embeddings, top_k=3, threshold=0.70):
             })
     results.sort(key=lambda x: x["cosine_similarity"], reverse=True)
     return results[:top_k]
+
+
+# ── Async wrappers ──────────────────────────────────────────
+# Every model call in this module is synchronous, and they are invoked from
+# `async def` functions (nli_engine, stability, the pipeline). A CrossEncoder
+# forward pass therefore blocked the event loop: under EVAL_CONCURRENCY each
+# item's NLI batch stalled every other in-flight item's LLM HTTP calls, so
+# raising concurrency bought far less than it looked like it should.
+#
+# The lock is not optional. `_encoder` and `_nli` are single shared
+# module-level torch modules; running predict() on one from several threads at
+# once multiplies peak memory by the thread count and can exhaust a machine
+# that comfortably runs one. An RLock (not Lock) because the guarded functions
+# call each other — verify_claims_batch -> extract_relevant_sentences both
+# touch the models, and a plain Lock would deadlock on the re-entry.
+#
+# Deliberately a threading primitive rather than an asyncio one: an
+# asyncio.Semaphore binds to the event loop that first awaits it, which breaks
+# the moment a second loop appears (every `asyncio.run` in the test suite).
+_MODEL_LOCK = threading.RLock()
+
+
+def _locked(fn, *args, **kwargs):
+    with _MODEL_LOCK:
+        return fn(*args, **kwargs)
+
+
+async def averify_claims_batch(claims_with_passages, profile=None):
+    """`verify_claims_batch` off the event loop."""
+    return await asyncio.to_thread(_locked, verify_claims_batch, claims_with_passages, profile)
+
+
+async def abuild_entailment_matrix(claims, passages, profile=None):
+    """`build_entailment_matrix` off the event loop."""
+    return await asyncio.to_thread(_locked, build_entailment_matrix, claims, passages, profile)
+
+
+async def anli_predict(pairs, **kwargs):
+    """Raw NLI scoring off the event loop, for callers that build their own
+    pairs (verification/stability.py)."""
+    return await asyncio.to_thread(_locked, _nli.predict, pairs, **kwargs)

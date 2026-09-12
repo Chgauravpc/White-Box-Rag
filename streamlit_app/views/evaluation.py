@@ -114,7 +114,12 @@ except ApiError as e:
 if not runs:
     st.info("No evaluation runs yet. Click 'Run Evaluation' to establish a baseline.")
 else:
-    runs_chrono = list(reversed(runs))  # oldest -> newest for trend charts
+    # Trend charts plot end-to-end metrics (faithfulness, abstention, context
+    # relevance). Detector and retrieval runs report entirely different
+    # metrics, so including them would draw gaps in every series and imply a
+    # regression where there is only a different kind of run.
+    _e2e = [r for r in runs if (r.get("plane") or "end_to_end") == "end_to_end"]
+    runs_chrono = list(reversed(_e2e))  # oldest -> newest for trend charts
 
     st.markdown("#### Trends")
     r1, r2 = st.columns(2)
@@ -150,11 +155,20 @@ else:
         m = run.get("metrics", {})
         status = run.get("status") or ("complete" if m else "unknown")  # pre-W1.2 rows have no status column
         icon = _STATUS_ICON.get(status, "•")
-        with st.expander(f"{icon} Run #{run['id']} · {run.get('run_label') or '(unlabeled)'} · {run.get('started_at', '')[:19]}"):
+        plane = run.get("plane") or "end_to_end"
+        plane_tag = "" if plane == "end_to_end" else f" · [{plane}]"
+        with st.expander(f"{icon} Run #{run['id']}{plane_tag} · {run.get('run_label') or '(unlabeled)'} · {run.get('started_at', '')[:19]}"):
             if status == "failed":
                 st.error(f"Run failed: {run.get('error', '(no error recorded)')}")
             elif status == "running":
                 st.info("Run is still in progress (or was interrupted mid-run — see the Items tab for what completed so far).")
+
+            if plane != "end_to_end":
+                # A detector/retrieval run has none of the end-to-end metrics
+                # below; rendering them as zeros would be a fabricated result.
+                st.caption(f"{plane.capitalize()} plane run — metrics below are plane-specific.")
+                st.json(m, expanded=False)
+                continue
 
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Queries", m.get("num_queries", 0))

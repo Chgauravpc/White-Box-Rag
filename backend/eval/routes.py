@@ -49,6 +49,7 @@ class RunEvalRequest(BaseModel):
 
 class DetectorEvalRequest(BaseModel):
     dataset_path: str | None = None
+    run_label: str = ""
     # "none" leaves a benchmark's own evidence text untouched; anything else
     # makes the number un-reproducible outside this repo.
     premise_normalizer: str = "none"
@@ -56,6 +57,7 @@ class DetectorEvalRequest(BaseModel):
 
 class RetrievalEvalRequest(BaseModel):
     dataset_path: str | None = None
+    run_label: str = ""
     top_k: int | None = None
     # When set, labels are resolved against this frozen manifest (content
     # first), and the response carries a label_health block. Omit to score
@@ -138,19 +140,45 @@ async def trigger_detector_eval(request: DetectorEvalRequest):
     usable over a full external benchmark (FEVER / HaluEval / RAGTruth all
     ship (claim, evidence, label) rows directly).
 
-    Not persisted to `eval_runs`: that table's columns and metric shape
-    describe an end-to-end run, and writing a detector run into it would make
-    two incomparable things indistinguishable. Persistence lands with the rest
-    of the plane split.
+    Persisted to `eval_runs` with `plane='detector'`, so a detector run is
+    never mistaken for (or resumed as) an end-to-end one.
     """
     dataset_path = request.dataset_path or DEFAULT_DETECTOR_DATASET
     if not os.path.exists(dataset_path):
         raise HTTPException(status_code=404, detail=f"Detector dataset not found: {dataset_path}")
+    return _run_plane(
+        "detector", dataset_path, request.run_label,
+        lambda: run_detector_eval_from_file(dataset_path, profile=request.premise_normalizer),
+    )
+
+
+def _run_plane(plane: str, dataset_path: str, run_label: str, work, not_found=None):
+    """Run one non-end-to-end plane and record it in `eval_runs`.
+
+    The row is created BEFORE the work starts and finalized afterwards, the
+    same durability pattern `POST /run` uses (W1.2): a crash leaves a
+    diagnosable `failed` row rather than silence. `plane` tags the row so the
+    three planes' incompatible metric shapes stay distinguishable.
+    """
+    run_id = insert_eval_run_started(
+        run_label=run_label, dataset_path=dataset_path, started_at=_utcnow_iso(), plane=plane,
+    )
     try:
-        return run_detector_eval_from_file(dataset_path, profile=request.premise_normalizer)
+        result = work()
     except Exception as exc:
-        logger.exception("Detector eval failed")
-        raise HTTPException(status_code=500, detail=f"Detector eval failed: {exc}")
+        finalize_eval_run(run_id, "failed", _utcnow_iso(), error=f"{type(exc).__name__}: {exc}")
+        if not_found is not None and isinstance(exc, not_found):
+            raise HTTPException(status_code=404, detail=str(exc))
+        logger.exception("%s eval failed", plane)
+        raise HTTPException(status_code=500, detail=f"{plane} eval failed: {exc}")
+
+    finalize_eval_run(
+        run_id, "complete", _utcnow_iso(),
+        num_queries=result.get("n", result.get("n_scored", 0)),
+        metrics_json=json.dumps({k: v for k, v in result.items() if k != "per_item"}),
+        per_query_json=json.dumps(result.get("per_item", [])),
+    )
+    return dict(result, run_id=run_id, plane=plane)
 
 
 @router.post("/retrieval")
@@ -170,15 +198,13 @@ async def trigger_retrieval_eval(request: RetrievalEvalRequest):
     dataset_path = request.dataset_path or DEFAULT_DATASET_PATH
     if not os.path.exists(dataset_path):
         raise HTTPException(status_code=404, detail=f"Dataset not found: {dataset_path}")
-    try:
-        return run_retrieval_eval_from_file(
+    return _run_plane(
+        "retrieval", dataset_path, request.run_label,
+        lambda: run_retrieval_eval_from_file(
             dataset_path, top_k=request.top_k, corpus_id=request.corpus_id
-        )
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
-    except Exception as exc:
-        logger.exception("Retrieval eval failed")
-        raise HTTPException(status_code=500, detail=f"Retrieval eval failed: {exc}")
+        ),
+        not_found=FileNotFoundError,
+    )
 
 
 @router.post("/corpus/freeze")

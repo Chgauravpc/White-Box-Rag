@@ -2,7 +2,7 @@ from typing import List, Tuple
 import numpy as np
 
 from shared.models import Claim, VerificationResult, NLIVerdict
-from shared.xai_matrices import verify_claims_batch, build_entailment_matrix
+from shared.xai_matrices import averify_claims_batch, abuild_entailment_matrix
 
 
 async def verify_all_claims(
@@ -23,8 +23,10 @@ async def verify_all_claims(
 
     pairs = [(claim.text, claim.source_passage) for claim in claims]
 
-    # Batched NLI — also applies extract_relevant_sentences() internally
-    raw_results = verify_claims_batch(pairs)
+    # Batched NLI, off the event loop (shared/xai_matrices.py::averify_claims_batch)
+    # — the synchronous CrossEncoder pass used to block every concurrently
+    # running query's LLM calls. Premise preparation happens inside.
+    raw_results = await averify_claims_batch(pairs)
 
     verifications     = []
     focused_passages  = []
@@ -53,7 +55,7 @@ async def verify_all_claims(
     claim_texts = [c.text for c in claims]
     passages    = list(dict.fromkeys([c.source_passage for c in claims if c.source_passage]))
     if passages:
-        E_matrix, _ = build_entailment_matrix(claim_texts, passages)
+        E_matrix, _ = await abuild_entailment_matrix(claim_texts, passages)
     else:
         E_matrix = np.array([])
 

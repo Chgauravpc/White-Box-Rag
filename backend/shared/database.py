@@ -192,6 +192,15 @@ def _init_sqlite_tables(conn):
     _ensure_column(conn, "documents", "source_path", "TEXT")
     _ensure_column(conn, "documents", "parser_version", "TEXT")
 
+    # Which evaluation plane produced a run. The three planes report
+    # incompatible metric shapes (end-to-end has faithfulness and trust
+    # statuses, detector has AUROC over claim labels, retrieval has nDCG over
+    # chunk labels), so an untagged table would make incomparable runs
+    # indistinguishable rows and let a resume continue one plane's run as
+    # another's. Pre-existing rows are all end-to-end.
+    _ensure_column(conn, "eval_runs", "plane", "TEXT")
+    conn.execute("UPDATE eval_runs SET plane = 'end_to_end' WHERE plane IS NULL")
+
     conn.commit()
 
 
@@ -351,7 +360,7 @@ def insert_eval_run_started(
     run_label, dataset_path, started_at,
     run_config_json=None, git_commit=None, corpus_manifest_json=None,
     dataset_hash=None, active_calibration_json=None, model_identities_json=None,
-    eval_mode=None, parent_run_id=None,
+    eval_mode=None, parent_run_id=None, plane="end_to_end",
 ):
     conn = get_sqlite_connection()
     try:
@@ -359,12 +368,12 @@ def insert_eval_run_started(
             "INSERT INTO eval_runs "
             "(run_label, dataset_path, started_at, status, run_config_json, git_commit, "
             " corpus_manifest_json, dataset_hash, active_calibration_json, model_identities_json, "
-            " eval_mode, parent_run_id) "
-            "VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?)",
+            " eval_mode, parent_run_id, plane) "
+            "VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 run_label, dataset_path, started_at, run_config_json, git_commit,
                 corpus_manifest_json, dataset_hash, active_calibration_json, model_identities_json,
-                int(eval_mode) if eval_mode is not None else None, parent_run_id,
+                int(eval_mode) if eval_mode is not None else None, parent_run_id, plane,
             ),
         )
         conn.commit()
@@ -392,7 +401,8 @@ def list_eval_runs():
     conn = get_sqlite_connection()
     try:
         rows = conn.execute(
-            "SELECT id, run_label, dataset_path, started_at, finished_at, num_queries, metrics_json, status, git_commit "
+            "SELECT id, run_label, dataset_path, started_at, finished_at, num_queries, "
+            "metrics_json, status, git_commit, plane, error "
             "FROM eval_runs ORDER BY id DESC"
         ).fetchall()
         return [dict(row) for row in rows]
