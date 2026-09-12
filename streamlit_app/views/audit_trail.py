@@ -62,7 +62,7 @@ if audit_id:
         m1, m2, m3 = st.columns(3)
         m1.metric("Claims Verified", len(claims))
         m2.metric("Total Latency", f"{sum(latency.values()):.0f}ms" if latency else "N/A")
-        m3.metric("Gemini Calls", report.get("gemini_call_count", "N/A"))
+        m3.metric("LLM Calls", report.get("llm_call_count", "N/A"))
 
         st.divider()
         st.markdown("#### Query")

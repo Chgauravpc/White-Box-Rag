@@ -1,7 +1,7 @@
 """
 RAG Pipeline — Retrieval-Augmented Generation with claim-level attribution.
 
-Retrieves relevant chunks, builds a Gemini prompt, then parses the response
+Retrieves relevant chunks, builds an LLM prompt, then parses the response
 into individual claims with source citations.
 """
 
@@ -10,14 +10,15 @@ import re
 
 import spacy
 import numpy as np
-from shared.gemini import call_gemini
+from shared import config
+from shared.llm import call_llm
 from shared.models import ChunkMetadata, Claim, RAGResponse
 from shared.xai_matrices import build_attribution_matrix, attribute_sentence
 
 logger = logging.getLogger(__name__)
 
 # Load spacy for sentence splitting
-nlp = spacy.load("en_core_web_sm")
+nlp = spacy.load(config.SPACY_MODEL)
 
 # ──────────────────────────────────────────────
 #  Prompt Templates
@@ -108,14 +109,14 @@ def parse_claims(answer: str, chunks: list[dict]) -> tuple[list[Claim], np.ndarr
 # ──────────────────────────────────────────────
 
 async def rag_query(
-    query: str, chunks: list[dict], temperature: float = 0.2
+    query: str, chunks: list[dict], temperature: float = config.GENERATION_TEMPERATURE
 ) -> tuple[RAGResponse, np.ndarray]:
     """Execute the full RAG pipeline using pure Math extraction.
 
     Args:
         query: The user's natural language question.
         chunks: Pre-retrieved list of dictionaries representing chunks.
-        temperature: Gemini sampling temperature. Default 0.2 for the primary
+        temperature: LLM sampling temperature. Default 0.2 for the primary
             answer; verification/stability.py passes a higher value to draw a
             second, genuinely different sample for self-consistency checking.
 
@@ -135,10 +136,10 @@ async def rag_query(
         query=query,
     )
 
-    # 3. Call Gemini
+    # 3. Call the LLM
     logger.info(f"RAG gen for query '{query[:80]}...' with {len(chunks)} sources")
 
-    answer = await call_gemini(
+    answer = await call_llm(
         prompt=user_prompt,
         system_instruction=RAG_SYSTEM_PROMPT,
         temperature=temperature,

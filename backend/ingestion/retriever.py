@@ -13,6 +13,7 @@ from rank_bm25 import BM25Okapi
 from shared.config import DENSE_TOP_K, SPARSE_TOP_K, FINAL_TOP_K, RRF_K
 from shared.database import get_chroma_collection
 from shared.models import ChunkMetadata
+from shared.chunk_key import resolve_chunk_key
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +109,7 @@ class BM25Index:
                 section_title=meta.get("section_title", ""),
                 page_number=meta.get("page_number", 0),
                 chunk_text=self._documents[idx],
+                chunk_key=meta.get("chunk_key", ""),
             )
             results.append((chunk, score))
 
@@ -172,6 +174,7 @@ def dense_search_with_scores(
                 section_title=meta.get("section_title", ""),
                 page_number=meta.get("page_number", 0),
                 chunk_text=doc,
+                chunk_key=meta.get("chunk_key", ""),
             )
             chunks_with_scores.append((chunk, cosine_sim))
 
@@ -209,9 +212,8 @@ def reciprocal_rank_fusion(
     scores: dict[str, float] = defaultdict(float)
     chunk_map: dict[str, ChunkMetadata] = {}
 
-    # Key function: use section_id + first 80 chars of text for dedup
     def _key(chunk: ChunkMetadata) -> str:
-        return f"{chunk.publication_name}|{chunk.edition_date}|{chunk.section_id}|{chunk.chunk_text[:80]}"
+        return resolve_chunk_key(chunk.publication_name, chunk.edition_date, chunk.section_id, chunk.chunk_text, chunk.chunk_key)
 
     # Score dense results
     for rank, chunk in enumerate(dense_results):
@@ -260,7 +262,7 @@ def hybrid_retrieve_with_scores(
     dense_with_scores = dense_search_with_scores(query, top_k=DENSE_TOP_K, filters=filters)
     dense_results = [chunk for chunk, _ in dense_with_scores]
     dense_score_map = {
-        f"{c.publication_name}|{c.edition_date}|{c.section_id}|{c.chunk_text[:80]}": s
+        resolve_chunk_key(c.publication_name, c.edition_date, c.section_id, c.chunk_text, c.chunk_key): s
         for c, s in dense_with_scores
     }
 
@@ -268,7 +270,7 @@ def hybrid_retrieve_with_scores(
     bm25 = get_bm25_index()
     sparse_results = bm25.search(query, top_k=SPARSE_TOP_K, filters=filters)
     bm25_score_map = {
-        f"{c.publication_name}|{c.edition_date}|{c.section_id}|{c.chunk_text[:80]}": s
+        resolve_chunk_key(c.publication_name, c.edition_date, c.section_id, c.chunk_text, c.chunk_key): s
         for c, s in sparse_results
     }
 
@@ -276,7 +278,7 @@ def hybrid_retrieve_with_scores(
     fused = reciprocal_rank_fusion(dense_results, sparse_results)
 
     def _key(chunk: ChunkMetadata) -> str:
-        return f"{chunk.publication_name}|{chunk.edition_date}|{chunk.section_id}|{chunk.chunk_text[:80]}"
+        return resolve_chunk_key(chunk.publication_name, chunk.edition_date, chunk.section_id, chunk.chunk_text, chunk.chunk_key)
 
     # 4. Build RRF scores
     rrf_scores: dict[str, float] = defaultdict(float)
@@ -290,9 +292,8 @@ def hybrid_retrieve_with_scores(
     score_records = []
     for rank, chunk in enumerate(top_fused):
         k = _key(chunk)
-        chunk_id = f"{chunk.publication_name}_{chunk.edition_date}_{chunk.section_id}_c{rank}"
         score_records.append({
-            "chunk_id": chunk_id,
+            "chunk_id": k,
             "section_id": chunk.section_id,
             "publication": chunk.publication_name,
             "edition": chunk.edition_date,

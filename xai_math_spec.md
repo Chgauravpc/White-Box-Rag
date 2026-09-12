@@ -5,7 +5,7 @@
 | Component | Mathematical Method | Role in XAI |
 |---|---|---|
 | **Retriever** | Similarity Matrix **S = QKᵀ / √d** | Explains why documents were chosen |
-| **Generator** | Attention Matrix **A = softmax(QKᵀ / √dₖ) · V** | Explains what content was used |
+| **Attribution** | Attribution Matrix **A = sentence_emb · chunk_embᵀ** (cosine) | Explains what content each claim used |
 | **Encoder** | SVD / PCA on embeddings | Visualises knowledge structure |
 | **Reasoner** | Graph/Adjacency Matrix of claims | Maps relational knowledge |
 | **Evaluator** | Shapley/Confidence Matrix | Assigns trust scores to output |
@@ -61,55 +61,81 @@ Where k = 60 (standard constant). This ensures chunks that rank highly in **both
 
 ---
 
-## 2. Claim-Level Attribution — Attention Matrix
+## 2. Claim-Level Attribution — Attribution Matrix (cosine similarity)
+
+> **Corrected 2026-08.** This section previously described a forced inline-citation
+> mechanism (`[PUB·EDITION·SECTION·CHUNK]` brackets parsed out of the LLM's
+> output) framed as "materializing the transformer's attention matrix." That
+> was never an accurate description of an LLM's actual internal attention
+> weights (a citation string can't reveal those), and it no longer describes
+> the code either: `rag.py`'s system prompt now explicitly instructs the
+> model **not** to include inline citations, and attribution is computed by
+> an entirely separate, deterministic step — not by parsing anything out of
+> the generated text at all.
 
 ### How it works in our system
 
-When Gemini Pro generates the RAG answer, the response is forced (via prompt engineering) to include citation keys like `[FSR·Jun2024·1.1·c0]` after every claim sentence. This directly **materialises the Attention Matrix**.
+The LLM (Groq or OpenRouter, config-driven — see `shared/llm.py`) generates a
+plain-prose answer with **no** inline citation syntax. `rag.py::parse_claims()`
+then splits that answer into sentences (spaCy) and hands them, together with
+the retrieved chunks, to `shared/xai_matrices.py::build_attribution_matrix()` —
+a pure-math step with zero LLM involvement.
 
-### Theoretical Basis
+### Mathematical Model
 
-Inside Gemini's transformer, for each generated token, the **scaled dot-product attention** over all input (source chunk) tokens is:
+Let **E ∈ ℝᵃˣᵈ** be the sentence-transformer embeddings (`BAAI/bge-large-en-v1.5`,
+d = 1024) of the m generated sentences, and **C ∈ ℝⁿˣᵈ** the embeddings of the
+n retrieved chunks. The **Attribution Matrix** is:
 
 ```
-A = softmax(Q · Kᵀ / √dₖ) · V     ∈ ℝ^(output_len × d_v)
+A = Ê · Ĉᵀ     ∈ ℝ^(m × n),   Ê, Ĉ = row-L2-normalized E, C
 ```
 
-Where:
-- **Q** = query matrix (generated tokens being predicted)
-- **K** = key matrix (all input chunk tokens)
-- **V** = value matrix (semantic content of input chunks)
-- **√dₖ** = scaling factor to prevent softmax saturation
+so `A[i][j] = cos(sentence_i, chunk_j)`. For each sentence i,
+`attribute_sentence()` takes the **argmax** over chunks:
 
-Each row Aᵢ of the attention matrix tells us which input tokens (i.e., which source chunks) had the **highest attention weight** when generating output token i.
-
-### What we capture
-
-Our `parse_claims()` function in `rag.py` extracts this implicitly:
-
-```python
-# Regex extracts [PUB·EDITION·SECTION·CHUNK] citations from each sentence
-CITATION_PATTERN = re.compile(r"\[([^\]]+)\]")
-claims = []
-for sentence in sentences:
-    citations = CITATION_PATTERN.findall(sentence)
-    source_chunk = _find_chunk_by_key(citations[0], chunks)
-    claims.append(Claim(
-        text=sentence,
-        source_passage=source_chunk.chunk_text[:500],
-        ...
-    ))
+```
+primary_chunk(i) = argmax_j A[i][j]
+attribution_score(i) = max_j A[i][j]
 ```
 
-The citation in each claim sentence is a **symbolic proxy for the maximum attention weight** — Gemini is forced to declare which chunk most strongly influenced each generated claim, recreating interpretable attribution from the otherwise opaque attention matrix.
+If `attribution_score(i) < MIN_ATTRIBUTION_SCORE` (0.45, configurable via
+`shared/config.py`), the sentence is left **unattributed** rather than forced
+onto a poor match. `compute_primary_attributions()` additionally records the
+runner-up chunk and the confidence gap between the top two matches; a small
+gap (< `AMBIGUITY_GAP_THRESHOLD`) flags the attribution as **ambiguous**,
+which feeds a Trust Gate/Shapley penalty (§4) — a claim isn't just "attributed
+to the wrong place," it's specifically flagged as *ambiguously* attributed
+when two chunks are near-tied.
+
+### What this replaces
+
+There is no citation-parsing code in the current pipeline — no regex, no
+forced bracket syntax, no dependency on the LLM cooperating with a citation
+instruction. `Claim.source_section_id`/`source_passage` are populated
+entirely from the Attribution Matrix argmax, which is why claim attribution
+is reconstructible and auditable independent of what the LLM actually did
+internally.
 
 ---
 
 ## 3. Hallucination Detection — NLI Entailment Score
 
+> **Corrected 2026-08.** This section previously said the generative LLM
+> (then Gemini) acts "as an NLI judge." It never did, and this is the single
+> most important correction in this document: verification runs on a
+> **local, non-generative CrossEncoder model** (`cross-encoder/nli-deberta-v3-base`,
+> `shared/xai_matrices.py`), never the LLM that wrote the answer. This is the
+> project's core "LLM extracts, math judges" design principle — no
+> LLM-as-judge anywhere in the verification loop — and the earlier wording
+> directly contradicted it.
+
 ### How it works in our system
 
-For **every claim** produced by BP1, BP2's `verify_claim()` calls Gemini as an NLI judge, producing a structured verdict.
+For **every claim**, `verification/nli_engine.py::verify_all_claims()` batches
+`(claim_text, source_passage)` pairs through the local CrossEncoder
+(`shared/xai_matrices.py::verify_claims_batch`), producing a structured
+verdict with zero LLM calls.
 
 ### Mathematical Model
 
@@ -119,7 +145,7 @@ Formally, NLI models a **conditional probability distribution**:
 P(label | premise p, hypothesis h)    where label ∈ {ENTAILMENT, NEUTRAL, CONTRADICTION}
 ```
 
-Gemini returns a confidence score which we interpret as:
+The CrossEncoder returns a 3-way softmax over exactly this distribution:
 
 ```
 entailment_score ≡ P(ENTAILMENT | source_passage, claim_text)     ∈ [0.0, 1.0]
@@ -194,42 +220,45 @@ The claims with the largest φᵢ are the most impactful on the final gate decis
 
 ## 5. BRD Compliance Engine — Alignment Score & Gap Analysis
 
+> **Corrected 2026-08.** This section previously described `alignment_score`
+> as a computed average cosine similarity, with a derived
+> `Compliance_Score = 100 × Alignment_Score × (1 - violation_penalty)`
+> formula. Neither formula is computed anywhere in `mapper.py` — unlike
+> retrieval, NLI verification, and the Trust Gate (all pure math), the BRD
+> alignment/gap/violation/risk-level judgment is **produced directly by the
+> LLM's structured JSON output**, not derived from a similarity score. This
+> is a deliberate scope note, not just a correction: `compliance/mapper.py`
+> is the one place in the pipeline where "math judges" doesn't hold — the
+> LLM extracts *and* judges here. Wording below is also now domain-generic
+> (the collection label is free text, not tied to any regulator).
+
 ### How it works in our system
 
-When `map_requirement()` in `mapper.py` processes a BRD requirement, it uses hybrid retrieval to find the top-5 most relevant RBI sections, then prompts Gemini to produce a structured compliance evaluation.
+`map_requirement()` in `mapper.py` uses hybrid retrieval (§1 — real cosine +
+BM25 + RRF math) to find the top-5 most relevant retrieved sections for a
+requirement, then prompts the LLM (Groq or OpenRouter) with those sections
+and asks for a structured compliance evaluation.
 
-### Mathematical Model
+### What the retrieval step computes (real math)
 
-Let **r ∈ ℝᵈ** be the embedding of the BRD requirement text.  
-Let **s₁, s₂, ..., s₅ ∈ ℝᵈ** be the embeddings of the top-5 retrieved RBI sections.
+Let **r ∈ ℝᵈ** be the embedding of the requirement text and
+**s₁, ..., s₅ ∈ ℝᵈ** the embeddings of the top-5 retrieved sections
+(`hybrid_retrieve`, §1's dense+BM25+RRF math — this part is deterministic).
 
-The **semantic alignment score** for each section sⱼ is:
+### What the LLM produces (not a formula)
 
-```
-alignment(r, sⱼ) = (r · sⱼᵀ) / (‖r‖ · ‖sⱼ‖)     ∈ [-1, 1]
-```
-
-The **overall alignment score** for the requirement against all retrieved sections is:
-
-```
-Alignment_Score = (1/5) Σⱼ alignment(r, sⱼ)     ∈ [0, 1]
-```
-
-But Gemini goes further — given the actual requirement and section texts, it produces:
-- **gaps**: requirements present in the BRD but not covered by any RBI section
-- **violations**: requirements in the BRD that directly conflict with RBI guidance
+Given the requirement and the retrieved section texts, the LLM returns
+structured JSON containing:
+- **alignment_score**: the model's own judgment of how well the requirement
+  is covered by the retrieved sections
+- **gaps**: requirements present in the BRD but not covered by any retrieved section
+- **violations**: requirements that directly conflict with the retrieved sections
 - **risk_level**: HIGH / MEDIUM / LOW based on the severity of gaps/violations
 - **remediation_suggestions**: explicit corrective actions
 
-### Compliance Score Formula (0-100)
-
-```
-Compliance_Score = 100 × Alignment_Score × (1 - violation_penalty)
-
-where violation_penalty = min(1.0, |violations| × 0.25)
-```
-
-A requirement with no violations and perfect alignment scores 100. Each violation reduces the score by 25 points up to a floor of 0.
+None of these are recomputed or cross-checked against the retrieval
+similarity scores — they are read directly from the LLM's response (with a
+fixed fallback value on a parse/API failure; see `mapper.py`).
 
 ---
 
@@ -243,16 +272,16 @@ A requirement with no violations and perfect alignment scores 100. Each violatio
 
 | Field | Mathematical Source | Explainability Purpose |
 |---|---|---|
-| `claims[].source_section_id` | RRF top-1 chunk ID | Which document drove each claim |
-| `claims[].source_passage` | Raw chunk text (attention arg-max) | Exact text the model "attended to" |
-| `verifications[].entailment_score` | P(ENTAILMENT \| premise, hypothesis) | Probability the claim is grounded |
+| `claims[].source_section_id` | Attribution Matrix argmax (cosine similarity, §2) | Which chunk drove each claim |
+| `claims[].source_passage` | Chunk text at the argmax index | Exact text the attribution points to |
+| `verifications[].entailment_score` | P(ENTAILMENT \| premise, hypothesis) — local CrossEncoder (§3) | Probability the claim is grounded |
 | `verifications[].verdict` | NLI classification label | Discrete grounding decision |
 | `trust_gate.overall_score` | Shapley penalty summation | Composite hallucination risk measure |
 | `trust_gate.status` | Decision boundary classifier | Final compliance ruling |
 | `trust_gate.reasoning` | Per-claim penalty trace | Full decision audit trail |
-| `compliance_evidence[].alignment_score` | Cosine similarity of req vs sections | How well BRD maps to RBI law |
-| `compliance_evidence[].gaps` | Gemini gap analysis | What is missing from the BRD |
-| `edition_traceability` | Cross-edition similarity comparison | Which RBI edition is authoritative |
+| `compliance_evidence[].alignment_score` | LLM judgment over retrieved sections (§5 — not a computed formula) | How well the BRD maps to the retrieved corpus |
+| `compliance_evidence[].gaps` | LLM gap analysis | What is missing from the BRD |
+| `edition_traceability` | Cross-edition similarity comparison | Which edition is authoritative |
 
 ### Full Pipeline Math Summary
 
@@ -263,19 +292,26 @@ Query q
 [Retriever]    S = q·Kᵀ/‖q‖‖K‖  +  BM25 → RRF → top-10 chunks C
   │
   ▼
-[Generator]    A = softmax(QKᵀ/√dₖ)V  → Answer + claims {c₁,...,cₙ} with citations
+[Generation]   LLM(Groq/OpenRouter) generates plain-prose Answer (no citations)
   │
   ▼
-[NLI Verifier] ∀cᵢ → P(ENTAILMENT|cᵢ.passage, cᵢ.text) = entailment_score(cᵢ)
+[Attribution]  A = sentence_embs·chunk_embsᵀ (cosine) → argmax → claims {c₁,...,cₙ} + source chunk
+  │
+  ▼
+[NLI Verifier] ∀cᵢ → local CrossEncoder: P(ENTAILMENT|cᵢ.passage, cᵢ.text) = entailment_score(cᵢ)
   │
   ▼
 [Trust Gate]   Overall_Score = 1 - Σ penalties(cᵢ)  → Status ∈ {SAFE, REVIEW, NON_COMPLIANT}
   │
   ▼
-[BRD Mapper]   alignment(r,sⱼ) = r·sⱼᵀ/‖r‖‖sⱼ‖  → Compliance_Score + gaps + violations
+[BRD Mapper]   retrieval(r,sⱼ) real cosine+BM25+RRF math → LLM judges alignment_score + gaps + violations
   │
   ▼
-[Audit Store]  Full JSON artifact → SQLite  (complete mathematical trace)
+[Audit Store]  Full JSON artifact → SQLite, SHA-256 hash-chained  (complete mathematical trace)
 ```
 
-Every step is **deterministic**, **traceable**, and **reconstructible** from the stored audit record. This is what makes the framework genuinely "Explainable AI" rather than a black box.
+Every step except the BRD Mapper's compliance judgment and the answer
+generation itself is **deterministic**, **traceable**, and **reconstructible**
+from the stored audit record — that's the actual scope of "no LLM in the
+decision loop": generation and BRD compliance judgment are LLM steps;
+retrieval, attribution, NLI verification, and trust gating are not.

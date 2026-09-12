@@ -1,11 +1,11 @@
 """
 Tests for verification/mitigation.py — claim-level filtering and abstention.
 
-Pure functions over synthetic inputs; no ML models or Gemini calls needed.
+Pure functions over synthetic inputs; no ML models or LLM calls needed.
 """
 
 from shared.models import Claim, VerificationResult, NLIVerdict
-from verification.mitigation import filter_claims, should_abstain
+from verification.mitigation import filter_claims, should_abstain, nonconformity_score
 
 
 def _claim(text, section_id="1.1"):
@@ -156,3 +156,69 @@ class TestShouldAbstain:
         abstained, reason, score = should_abstain(claims, verifications, attrs, retained_flags, [])
 
         assert abstained is False
+
+    def test_explicit_threshold_overrides_the_disk_read(self):
+        """A frozen threshold passed by the caller must win over whatever
+        load_active_threshold() would return — this is what lets a long eval
+        run read the calibration once instead of re-reading disk per item."""
+        claims = [_claim(f"c{i}") for i in range(4)]
+        verifications = [_verification(f"c{i}", NLIVerdict.NEUTRAL, 0.6) for i in range(4)]
+        attrs = [_attr(score=0.5, ambiguous=True) for _ in range(4)]
+        retained_flags = [True, True, True, True]
+
+        mean_penalty, _ = nonconformity_score(claims, verifications, attrs, retained_flags, [])
+
+        # A threshold set below the actual mean penalty must trigger abstention...
+        abstained_low, _, _ = should_abstain(claims, verifications, attrs, retained_flags, [], threshold=mean_penalty - 0.01)
+        assert abstained_low is True
+        # ...and one set above it must not, regardless of any on-disk calibration.
+        abstained_high, _, _ = should_abstain(claims, verifications, attrs, retained_flags, [], threshold=mean_penalty + 0.01)
+        assert abstained_high is False
+
+
+class TestNonconformityScore:
+    """The shared function should_abstain AND the eval harness's calibration
+    pipeline both call — factored out so the two can no longer compute
+    different numbers for the same decision (finding #16)."""
+
+    def test_empty_retrieval_has_no_score(self):
+        """'No claims at all' (empty retrieval) has no mean-penalty score —
+        must be None, not a fabricated 0.0 (which harness.py used to inject
+        by computing (1 - 1.0) / max(1, 0) = 0.0)."""
+        score, gate = nonconformity_score([], [], [], [], [])
+        assert score is None
+        assert gate is None
+
+    def test_all_claims_stripped_has_no_score(self):
+        """Every claim stripped (nothing retained) has no mean-penalty score
+        either — must be None, not a fabricated 1.0 (which harness.py used
+        to inject via n_retained=0 -> max(1,0)=1 -> (1-0)/1=1.0)."""
+        claims = [_claim("A")]
+        verifications = [_verification("A", NLIVerdict.CONTRADICTION, 0.1)]
+        attrs = [_attr()]
+        retained_flags = [False]  # nothing retained
+
+        score, gate = nonconformity_score(claims, verifications, attrs, retained_flags, [])
+        assert score is None
+        assert gate is None
+
+    def test_matches_should_abstains_internal_computation(self):
+        """The exact quantity should_abstain compares against the threshold
+        must be reproducible by calling nonconformity_score directly."""
+        claims = [_claim(f"c{i}") for i in range(3)]
+        verifications = [_verification(f"c{i}", NLIVerdict.NEUTRAL, 0.6) for i in range(3)]
+        attrs = [_attr(score=0.5, ambiguous=True) for _ in range(3)]
+        retained_flags = [True, True, True]
+
+        score, gate = nonconformity_score(claims, verifications, attrs, retained_flags, [])
+        assert score is not None
+        assert 0.0 <= score <= 1.0
+        assert gate is not None
+
+        # A threshold pinned exactly at the computed score must not abstain
+        # (mean_penalty > ceil is strict), one epsilon below it must.
+        not_abstained, _, ret_score = should_abstain(claims, verifications, attrs, retained_flags, [], threshold=score)
+        assert not_abstained is False
+        assert ret_score == gate.overall_score
+        abstained, _, _ = should_abstain(claims, verifications, attrs, retained_flags, [], threshold=score - 1e-9)
+        assert abstained is True

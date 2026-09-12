@@ -45,7 +45,7 @@ if run and query.strip():
         edition_conflicts = report.get("edition_conflicts", [])
         abstained = report.get("abstained", False)
         latency = report.get("latency_ms", {})
-        gemini_calls = report.get("gemini_call_count", 0)
+        llm_calls = report.get("llm_call_count", 0)
 
         st.divider()
 
@@ -85,7 +85,7 @@ if run and query.strip():
 
                 render_counterfactuals(report.get("counterfactuals", []))
 
-                st.caption(f"⏱️ {sum(latency.values()):.0f}ms total · {gemini_calls} Gemini call(s)")
+                st.caption(f"⏱️ {sum(latency.values()):.0f}ms total · {llm_calls} LLM call(s)")
 
             with side_col:
                 st.markdown("#### Trust Scorecard")

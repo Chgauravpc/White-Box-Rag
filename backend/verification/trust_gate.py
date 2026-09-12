@@ -1,7 +1,11 @@
 from typing import List
+from shared import config
 from shared.models import VerificationResult, EditionConflict, TrustGate, TrustStatus, NLIVerdict
 
-WEAK_ATTRIBUTION_SCORE = 0.65
+# Re-exported from config (not re-declared as a literal) — this used to be
+# an independent copy of the same value declared separately in
+# shared/xai_matrices.py and verification/mitigation.py, a real drift risk.
+WEAK_ATTRIBUTION_SCORE = config.WEAK_ATTRIBUTION_SCORE
 
 
 def compute_trust_gate(
@@ -39,7 +43,7 @@ def compute_trust_gate(
     unresolved = [c for c in conflicts if c.has_conflict]
     if unresolved:
         reasons.append("Unresolved edition conflicts detected.")
-        overall_score -= 0.5
+        overall_score -= config.PENALTY_EDITION_CONFLICT
 
     # 2. NLI verdicts
     has_contradiction     = False
@@ -48,28 +52,37 @@ def compute_trust_gate(
     has_medium_confidence = False
 
     for v in verifications:
-        if v.verdict in (NLIVerdict.CONTRADICTION, NLIVerdict.CONTRADICTED):
+        is_contradiction = v.verdict in (NLIVerdict.CONTRADICTION, NLIVerdict.CONTRADICTED)
+        if is_contradiction:
             has_contradiction = True
             reasons.append(f"Contradiction: '{v.claim_text[:60]}...'")
-            overall_score -= 0.3
+            overall_score -= config.PENALTY_CONTRADICTION
         elif v.verdict in (NLIVerdict.NEUTRAL, NLIVerdict.NOT_ENOUGH_INFO):
             has_neutral = True
             reasons.append(f"Neutral verdict: '{v.claim_text[:60]}...'")
-            overall_score -= 0.1
+            overall_score -= config.PENALTY_NEUTRAL
 
-        if v.entailment_score < 0.5:
-            has_low_confidence = True
-            reasons.append(f"Low NLI confidence ({v.entailment_score:.2f})")
-            overall_score -= 0.2
-        elif 0.5 <= v.entailment_score <= 0.8:
-            has_medium_confidence = True
-            reasons.append(f"Medium NLI confidence ({v.entailment_score:.2f})")
-            overall_score -= 0.05
+        # Confidence-band penalty is skipped once a claim is already a
+        # CONTRADICTION — mirrors xai_matrices.py::compute_shapley_contributions
+        # exactly (same guard there). Without this guard a CONTRADICTION with
+        # entailment_score < LOW_CONFIDENCE_CEIL is double-penalized here but
+        # only single-penalized in the Shapley computation, so overall_score
+        # silently diverges from shapley["overall_score"] — exactly the
+        # consistency the docstring above promises.
+        if not is_contradiction:
+            if v.entailment_score < config.LOW_CONFIDENCE_CEIL:
+                has_low_confidence = True
+                reasons.append(f"Low NLI confidence ({v.entailment_score:.2f})")
+                overall_score -= config.PENALTY_LOW_CONFIDENCE
+            elif config.LOW_CONFIDENCE_CEIL <= v.entailment_score <= config.MID_CONFIDENCE_CEIL:
+                has_medium_confidence = True
+                reasons.append(f"Medium NLI confidence ({v.entailment_score:.2f})")
+                overall_score -= config.PENALTY_MID_CONFIDENCE
 
     # 3. Attribution quality — same penalty scale as Shapley for score consistency
     for a in primary_attributions:
         if a.get("ambiguous"):
-            overall_score -= 0.05
+            overall_score -= config.PENALTY_AMBIGUOUS_ATTRIBUTION
             has_weak_attribution = True
             reasons.append(
                 "Ambiguous attribution (gap={:.4f}) sentence {}.".format(
@@ -77,7 +90,7 @@ def compute_trust_gate(
                 )
             )
         elif a.get("attribution_score", 1.0) < WEAK_ATTRIBUTION_SCORE:
-            overall_score -= 0.03
+            overall_score -= config.PENALTY_WEAK_ATTRIBUTION
             has_weak_attribution = True
             reasons.append(
                 "Weak attribution (score={:.4f}) sentence {}.".format(

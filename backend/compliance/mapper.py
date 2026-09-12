@@ -2,8 +2,9 @@ import json
 import logging
 import asyncio
 from typing import List, Dict, Any
+from shared import config
 from shared.models import BRDRequirement
-from shared.gemini import call_gemini
+from shared.llm import call_llm
 
 logger = logging.getLogger(__name__)
 
@@ -71,15 +72,15 @@ Relevant Knowledge Base Sources: {formatted_sections}
     
     for attempt in range(max_retries + 1):
         try:
-            response_text = await call_gemini(prompt, temperature=0.1)
+            response_text = await call_llm(prompt, temperature=config.COMPLIANCE_TEMPERATURE)
             success = True
             break
         except Exception as e:
-            logger.error(f"Gemini API attempt {attempt + 1} failed: {e}")
+            logger.error(f"LLM API attempt {attempt + 1} failed: {e}")
             if attempt < max_retries:
                 await asyncio.sleep(2)
             else:
-                logger.error("All Gemini API retries failed. Returning fallback.")
+                logger.error("All LLM API retries failed. Returning fallback.")
                 return {
                     "requirement": req.text,
                     "alignment_score": 50,

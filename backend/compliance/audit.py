@@ -1,8 +1,10 @@
 import json
-from datetime import datetime
+from datetime import datetime, timezone
+from shared import config
 from shared.models import Claim, VerificationResult, TrustGate, EditionConflict, BRDRequirement
-from shared.gemini import call_gemini
+from shared.llm import call_llm
 from shared.database import get_sqlite_conn
+from compliance.domain_profiles import get_domain_profile
 
 async def generate_audit_report(
     query: str,
@@ -14,7 +16,7 @@ async def generate_audit_report(
     brd_results: list[BRDRequirement]
 ) -> dict:
     """
-    Generates a structured audit report using Gemini Pro, 
+    Generates a structured audit report using the configured LLM, 
     and commits the log to the SQLite database.
     """
     
@@ -25,7 +27,16 @@ async def generate_audit_report(
     conflicts_json = json.dumps([c.model_dump() for c in edition_conflicts], indent=2)
     brd_results_json = json.dumps([b.model_dump() for b in brd_results], indent=2)
 
-    # 2. Build the exact prompt requested
+    # 2. Build the prompt — few-shot example values come from the active
+    # domain profile (shared.config.DOMAIN_PROFILE), not a hardcoded domain.
+    profile = get_domain_profile()
+    fs_pub = profile["few_shot_publication"]
+    fs_ed = profile["few_shot_edition"]
+    fs_sec = profile["few_shot_section_id"]
+    fs_key = f"{fs_pub}·{fs_ed}·{fs_sec}"
+    fs_title = profile["few_shot_section_title"]
+    fs_summary = profile["few_shot_summary"]
+
     prompt = f"""
 You are a compliance auditor and Explainable AI (XAI) specialist.
 
@@ -140,7 +151,7 @@ Example:
   "decision_log": [
     {{
       "claim_text": "...",
-      "source": "FSR·Dec2024·3.1",
+      "source": "{fs_key}",
       "verification_verdict": "ENTAILMENT",
       "confidence_score": 0.92,
       "explanation": "The source clearly supports the claim"
@@ -148,27 +159,27 @@ Example:
   ],
   "section_reference_registry": [
     {{
-      "publication_name": "FSR",
-      "edition_date": "Dec 2024",
-      "section_id": "3.1",
-      "section_title": "Financial Stability Risks",
-      "summary": "Discusses major risks to financial stability"
+      "publication_name": "{fs_pub}",
+      "edition_date": "{fs_ed}",
+      "section_id": "{fs_sec}",
+      "section_title": "{fs_title}",
+      "summary": "{fs_summary}"
     }}
   ],
   "edition_traceability": {{
-    "editions_compared": ["June 2024", "Dec 2024"],
-    "conflicts_detected": true,
-    "authoritative_edition": "Dec 2024",
-    "reasoning": "Latest edition overrides previous guidance"
+    "editions_compared": ["{fs_ed}"],
+    "conflicts_detected": false,
+    "authoritative_edition": "{fs_ed}",
+    "reasoning": "Only one edition was consulted for this query"
   }},
   "compliance_evidence": [
     {{
       "requirement_id": "REQ-001",
       "alignment_score": 0.8,
-      "gaps": ["Missing fraud detection"],
+      "gaps": ["Example gap"],
       "violations": [],
       "risk_level": "MEDIUM",
-      "supporting_sections": ["FSR·3.1"]
+      "supporting_sections": ["{fs_pub}·{fs_sec}"]
     }}
   ],
   "final_audit_summary": {{
@@ -190,40 +201,56 @@ Example:
 - Output MUST be valid JSON
 """
 
-    # 3. Call Gemini
-    import asyncio
+    # 3. Call the LLM — degrade, don't raise (finding #17). A failed/malformed
+    # LLM narrative must not fail the whole query for a reason unrelated to
+    # what's actually being measured: retrieval, verification, and trust
+    # gating are all already computed deterministically by the time this
+    # function runs, and every one of those fields is still populated below
+    # regardless of whether the narrative call succeeded.
+    audit_report_error = ""
+    response_text = None
     try:
-        response_text = await call_gemini(prompt, temperature=0.1)
+        response_text = await call_llm(prompt, temperature=config.COMPLIANCE_TEMPERATURE)
     except Exception as e:
-        raise RuntimeError(f"Error calling Gemini to generate Audit Report: {e}")
+        audit_report_error = f"LLM call failed: {e}"
 
-    # 4. Clean JSON response from markdown wrappers
-    response_text = response_text.strip()
-    if response_text.startswith("```json"):
-        response_text = response_text[7:]
-    if response_text.startswith("```"):
-        response_text = response_text[3:]
-    if response_text.endswith("```"):
-        response_text = response_text[:-3]
-    response_text = response_text.strip()
+    audit_json = None
+    if response_text is not None:
+        # 4. Clean JSON response from markdown wrappers
+        cleaned = response_text.strip()
+        if cleaned.startswith("```json"):
+            cleaned = cleaned[7:]
+        if cleaned.startswith("```"):
+            cleaned = cleaned[3:]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+        cleaned = cleaned.strip()
 
-    # 5. Parse Output
-    try:
-        audit_json = json.loads(response_text)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Failed to parse audit JSON: {e}\nRaw Response:\n{response_text}")
+        # 5. Parse Output
+        try:
+            audit_json = json.loads(cleaned)
+        except json.JSONDecodeError as e:
+            audit_report_error = f"Failed to parse audit JSON: {e}"
 
-    # Update with true local runtime timestamp and raw strings
-    # We guarantee ALL fields of AuditReport are populated natively!
-    audit_json["timestamp"] = datetime.utcnow().isoformat()
+    if audit_json is None:
+        # Minimal fallback: only the LLM's narrative fields are missing —
+        # decision_log prose, section_reference_registry, and
+        # final_audit_summary's free-text reasoning. Everything mathematical
+        # is still stamped in below.
+        audit_json = {"final_audit_summary": {}}
+
+    # Update with a true UTC runtime timestamp and raw strings
+    # We guarantee ALL mathematically-derived fields of AuditReport are populated natively!
+    audit_json["timestamp"] = datetime.now(timezone.utc).isoformat()
     audit_json["query"] = query
     audit_json["response"] = rag_response
     audit_json["claims"] = [c.model_dump() for c in claims]
     audit_json["verifications"] = [v.model_dump() for v in verifications]
     audit_json["trust_gate"] = trust_gate.model_dump() if trust_gate else None
     audit_json["edition_conflicts"] = [c.model_dump() for c in edition_conflicts]
+    audit_json["audit_report_error"] = audit_report_error
 
-    # Gemini's narrative summary must never be allowed to contradict the
+    # The LLM's narrative summary must never be allowed to contradict the
     # deterministic Trust Gate — overwrite post-hoc rather than trust the LLM's
     # restatement of a value we already computed mathematically.
     if trust_gate and isinstance(audit_json.get("final_audit_summary"), dict):
@@ -258,7 +285,7 @@ def get_all_logs() -> list:
         try:
             data = json.loads(row["audit_data_json"])
             # risk_level comes from the deterministic trust_gate_status SQLite
-            # column (mathematically computed by Trust Gate), not Gemini's
+            # column (mathematically computed by Trust Gate), not the LLM's
             # narrative final_audit_summary — the two could otherwise disagree.
             risk_level = row["trust_gate_status"] or "Unknown"
             score = "N/A"

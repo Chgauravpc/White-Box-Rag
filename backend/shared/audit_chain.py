@@ -6,7 +6,7 @@ predecessor by SHA-256, blockchain-style: record_hash = sha256(prev_hash +
 canonical_json(record)). Any retroactive edit, deletion, or reordering breaks
 the chain and is detectable by `verify_chain`.
 
-Pure standard-library — no ML, no Gemini, no DB. The DB layer (shared/database.py)
+Pure standard-library — no ML, no LLM, no DB. The DB layer (shared/database.py)
 supplies rows; this module only does the math so it stays trivially unit-testable.
 """
 

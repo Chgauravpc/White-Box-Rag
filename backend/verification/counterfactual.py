@@ -3,7 +3,7 @@ counterfactual.py — contrastive "what would change the verdict" explanations.
 
 For a non-SAFE answer, show the human which claim, if removed, most improves the
 trust outcome — e.g. "removing claim 3 raises the score 0.55 → 0.85 and flips
-Non-Compliant → Needs Review." Pure math, no Gemini.
+Non-Compliant → Needs Review." Pure math, no LLM.
 
 Two correctness points drive the design:
 

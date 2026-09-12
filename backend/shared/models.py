@@ -5,7 +5,7 @@ All backend services (BP1, BP2, BP3) and the frontend (FP1) code against these s
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional, List, Dict, Any
 
@@ -71,10 +71,11 @@ class ChunkMetadata(BaseModel):
 
     publication_name: str = Field(..., description="Free-text collection/document label")
     edition_date: str = Field(..., description="Edition date, e.g. 'June 2024'")
-    section_id: str = Field(..., description="Section identifier, e.g. '1.1', '2.3.1'")
+    section_id: str = Field(..., description="Section identifier, e.g. '1.1', '2.3.1' — NOT globally unique on its own; two documents may share a section_id")
     section_title: str = Field(default="", description="Section heading text")
     page_number: int = Field(default=0, description="Source page in the PDF")
     chunk_text: str = Field(..., description="The actual text content of this chunk")
+    chunk_key: str = Field(default="", description="Canonical globally-unique chunk identity: 'publication|edition|section|ordinal' (see shared/chunk_key.py). Empty for chunks ingested before this field existed — callers should fall back to resolve_chunk_key().")
 
 
 class Claim(BaseModel):
@@ -85,6 +86,7 @@ class Claim(BaseModel):
     source_section_id: str = Field(default="", description="Section ID cited for this claim")
     source_passage: str = Field(default="", description="Full source chunk — for human reading")
     focused_passage: str = Field(default="", description="Top-K sentences fed to NLI — for audit")
+    premise_deletions: list[str] = Field(default_factory=list, description="Lines removed from the source passage by PREMISE_NORMALIZER before NLI scoring — for audit; empty unless the active profile deleted content")
     confidence: float = Field(default=1.0, ge=0.0, le=1.0, description="Confidence score (BP2 overwrites)")
     retained: bool = Field(default=True, description="False if stripped from the mitigated/filtered answer")
     filter_reason: str = Field(default="", description="Why this claim was stripped or flagged, e.g. 'contradiction', 'low_confidence', 'flagged:neutral'")
@@ -182,19 +184,19 @@ class BRDRequirement(BaseModel):
 
 
 class RetrievalMatrix(BaseModel):
-    chunk_ids: list[str] = Field(description="section IDs, length n")
+    chunk_ids: list[str] = Field(description="canonical chunk keys (publication|edition|section|ordinal), length n — NOT bare section IDs, which collide across documents")
     similarity_scores: list[float] = Field(description="S vector, length n")
 
 class EntailmentMatrix(BaseModel):
     claim_texts:   list[str] = Field(description="length m")
-    passage_ids:   list[str] = Field(description="section IDs only, e.g. COLLECTION-§I.2.1")
+    passage_ids:   list[str] = Field(description="'publication|edition|section' keys, e.g. 'FSR|Jun2024|I.2.1' — qualified so two documents sharing a section_id don't collide")
     passage_texts: list[str] = Field(default_factory=list, description="raw passage text for audit display")
     scores:        list[list[list[float]]] = Field(description="shape (m, n, 3) — E[i][j] = [contradiction, entailment, neutral] probs")
     labels:        list[str] = Field(default=["contradiction", "entailment", "neutral"])
 
 class AttributionMatrix(BaseModel):
     sentence_texts:       list[str] = Field(description="length m")
-    chunk_ids:            list[str] = Field(description="length n")
+    chunk_ids:            list[str] = Field(description="canonical chunk keys, length n — see RetrievalMatrix.chunk_ids")
     scores:               list[list[float]] = Field(description="shape (m, n) — A matrix")
     primary_attributions: list[dict] = Field(
         default_factory=list,
@@ -232,6 +234,24 @@ class Counterfactual(BaseModel):
     primary_driver: bool = Field(default=False, description="The single highest-leverage claim")
 
 
+class LLMCallRecord(BaseModel):
+    """Per-call provenance from the multi-key pool (Phase 2, W2.4) —
+    which endpoint actually served this call, not just how many happened.
+    Populated opportunistically: only calls made inside a
+    `shared.llm.llm_call_scope()` block are collected, so this list can be
+    shorter than `llm_call_count` for code paths that don't open a scope."""
+    provider: str
+    model: str
+    key_fingerprint: str = Field(description="SHA-256 prefix of the API key — never the raw key")
+    endpoint_id: str
+    prompt_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
+    total_tokens: Optional[int] = None
+    latency_ms: float = 0.0
+    attempts: int = 1
+    retry_history: list[str] = Field(default_factory=list)
+
+
 class RelatedQuery(BaseModel):
     """A past query semantically similar to the current query."""
     id: int
@@ -244,9 +264,9 @@ class RelatedQuery(BaseModel):
 class AuditReport(BaseModel):
     """Full audit trail for a governance interaction."""
     id: Optional[int] = None
-    timestamp: str = Field(default_factory=lambda: datetime.now().isoformat())
+    timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     query: str = Field(default="")
-    response: str = Field(default="", description="Raw, unfiltered Gemini answer — preserved for traceability")
+    response: str = Field(default="", description="Raw, unfiltered LLM answer — preserved for traceability")
     claims: list[Claim] = Field(default_factory=list)
     verifications: list[VerificationResult] = Field(default_factory=list)
     trust_gate: Optional[TrustGate] = None
@@ -266,9 +286,12 @@ class AuditReport(BaseModel):
     scorecard: Optional[TrustScorecard] = None
     # Counterfactual "what would change the verdict" explanations (Feature 4)
     counterfactuals: list[Counterfactual] = Field(default_factory=list)
-    # Observability (latency & Gemini call cost)
+    audit_report_error: str = Field(default="", description="Set when the LLM audit-narrative call/parse failed — the report still carries every mathematically-derived field (claims, verifications, trust_gate, etc.); only the LLM's narrative fields (decision_log prose, section_reference_registry, final_audit_summary text) are empty. Degrading here (rather than raising) is deliberate: a malformed narrative must not fail a query for a reason unrelated to what's actually being measured.")
+    # Observability (latency & LLM call cost)
     latency_ms: Dict[str, float] = Field(default_factory=dict, description="Per-stage wall-clock time")
-    gemini_call_count: int = Field(default=0)
+    llm_call_count: int = Field(default=0)
+    llm_calls: list[LLMCallRecord] = Field(default_factory=list,
+        description="Per-call pool provenance (Phase 2) — which endpoint/key served each call. May be shorter than llm_call_count; see LLMCallRecord.")
     # Tamper-evident audit chain (Feature 1) — SHA-256 link to the prior record
     prev_hash: Optional[str] = Field(default=None, description="record_hash of the preceding audit in the chain")
     record_hash: Optional[str] = Field(default=None, description="SHA-256 of this record chained on prev_hash")

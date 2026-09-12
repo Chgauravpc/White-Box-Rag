@@ -11,10 +11,23 @@ import re
 import fitz  # PyMuPDF
 
 from shared.config import CHUNK_MAX_TOKENS, CHUNK_OVERLAP_TOKENS
-from shared.database import get_chroma_collection, insert_document
+from shared.database import get_chroma_collection, upsert_document
 from shared.models import ChunkMetadata
+from shared.chunk_key import build_chunk_key
+from shared.hashing import hash_file
 
 logger = logging.getLogger(__name__)
+
+# ──────────────────────────────────────────────
+#  Parser identity
+# ──────────────────────────────────────────────
+# Bump by hand whenever section detection or chunking changes in a way that
+# alters chunk boundaries or chunk_key assignment. A git commit hash is too
+# coarse (every commit would invalidate a frozen corpus) and no version at all
+# is too loose — a labeled dataset pins this value via the corpus manifest
+# (shared/corpus_manifest.py) so a silent re-chunk can't invalidate labels
+# without being detected.
+PARSER_VERSION = "1.0"
 
 # ──────────────────────────────────────────────
 #  Regex patterns for structured (financial-report-style) section headers
@@ -366,6 +379,29 @@ def chunk_section(
 #  Step 4: End-to-end ingestion
 # ──────────────────────────────────────────────
 
+def _delete_existing_chunks(collection, publication: str, edition_date: str) -> int:
+    """Remove every chunk previously ingested for this (publication, edition).
+
+    Returns the number of chunks deleted. Best-effort: a backend that doesn't
+    support `where`-deletes shouldn't break ingestion, so failures are logged
+    and swallowed — the subsequent upsert still refreshes every chunk this
+    ingest produced.
+    """
+    where = {"$and": [
+        {"publication_name": {"$eq": publication}},
+        {"edition_date": {"$eq": edition_date}},
+    ]}
+    try:
+        existing = collection.get(where=where, include=[])
+        stale_ids = existing.get("ids", []) or []
+        if stale_ids:
+            collection.delete(ids=stale_ids)
+        return len(stale_ids)
+    except Exception as exc:  # pragma: no cover - backend-specific
+        logger.warning(f"Could not clear prior chunks for {publication}/{edition_date}: {exc}")
+        return 0
+
+
 def ingest_pdf(filepath: str, publication: str, edition_date: str) -> int:
     """Full pipeline: parse PDF → detect sections → chunk → store in ChromaDB + SQLite.
 
@@ -400,10 +436,20 @@ def ingest_pdf(filepath: str, publication: str, edition_date: str) -> int:
     documents = []
     metadatas = []
 
-    for i, chunk in enumerate(all_chunks):
-        # Deterministic ID to prevent duplicates on re-ingestion
-        chunk_id = f"{publication}_{edition_date}_{chunk.section_id}_chunk{i}"
-        ids.append(chunk_id)
+    # `ordinal` must be the index of the chunk WITHIN ITS SECTION, not a
+    # document-global counter. With a global counter, one extra chunk in an
+    # early section renumbers every chunk after it, silently re-pointing every
+    # labeled relevant_chunk_key in an eval dataset at different text.
+    section_ordinals: dict[str, int] = {}
+    for chunk in all_chunks:
+        ordinal = section_ordinals.get(chunk.section_id, 0)
+        section_ordinals[chunk.section_id] = ordinal + 1
+        # Canonical, globally-unique chunk identity (see shared/chunk_key.py) —
+        # doubles as the deterministic ChromaDB id, so re-ingestion upserts
+        # rather than duplicating.
+        chunk_key = build_chunk_key(publication, edition_date, chunk.section_id, ordinal)
+        chunk.chunk_key = chunk_key
+        ids.append(chunk_key)
         documents.append(chunk.chunk_text)
         metadatas.append({
             "publication_name": chunk.publication_name,
@@ -411,14 +457,30 @@ def ingest_pdf(filepath: str, publication: str, edition_date: str) -> int:
             "section_id": chunk.section_id,
             "section_title": chunk.section_title,
             "page_number": chunk.page_number,
+            "chunk_key": chunk_key,
         })
 
-    # Upsert to handle re-ingestion gracefully
+    # Re-ingestion must not leave orphans. `upsert` alone only overwrites the
+    # ids it is given: if a re-parse yields fewer chunks (or different keys
+    # after a chunking-config change), the previous ingest's surplus chunks
+    # stay in the collection and remain retrievable forever. Delete this
+    # (publication, edition) slice first so the corpus is exactly what this
+    # ingest produced.
+    _delete_existing_chunks(collection, publication, edition_date)
     collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
 
     # 5. Record in SQLite
     filename = os.path.basename(filepath)
-    insert_document(filename, publication, edition_date, len(all_chunks), structured=structured)
+    upsert_document(
+        filename,
+        publication,
+        edition_date,
+        len(all_chunks),
+        structured=structured,
+        source_sha256=hash_file(filepath),
+        source_path=os.path.abspath(filepath),
+        parser_version=PARSER_VERSION,
+    )
 
     logger.info(
         f"Ingested {len(all_chunks)} chunks from {filename} "

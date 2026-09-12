@@ -1,7 +1,7 @@
 """
 Tests for the human-in-the-loop review chain (Feature 2).
 
-Exercises the real DB helpers against conftest's temp SQLite (no Gemini, no
+Exercises the real DB helpers against conftest's temp SQLite (no LLM, no
 models). Covers: status derivation, supersession, pending-queue exclusion,
 chain integrity, and tamper detection.
 """

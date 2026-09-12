@@ -6,19 +6,34 @@ Singletons shared across all services.
 import os
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 
 import chromadb
 from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 
-from shared.config import CHROMA_PATH, SQLITE_PATH
+from shared.config import CHROMA_PATH, SQLITE_PATH, CHROMA_EMBEDDING_MODEL
 from shared.audit_chain import compute_record_hash, next_link
+
+
+def _utcnow_iso() -> str:
+    """Timezone-aware UTC timestamp for every event record in this module.
+
+    Previously this file used naive `datetime.now()` (local time) while
+    eval_runs used `datetime.utcnow()` (UTC, but also naive) — two tables'
+    timestamps weren't even in the same time base, let alone comparable.
+    Everything here now goes through this one helper.
+    """
+    return datetime.now(timezone.utc).isoformat()
 
 
 # ── ChromaDB ──────────────────────────────────────────────
 _chroma_client     = None
 _chroma_collection = None
-EMBEDDING_MODEL    = "all-MiniLM-L6-v2"
+# Deliberately configurable independently of shared/xai_matrices.py's
+# XAI_EMBEDDING_MODEL — they serve different purposes (this one actually
+# retrieves; xai_matrices.py's recomputes similarity/attribution). See
+# config.py's model-identity comment and benchmark-readiness finding #18.
+EMBEDDING_MODEL    = CHROMA_EMBEDDING_MODEL
 
 
 def get_chroma_collection():
@@ -95,6 +110,18 @@ def _init_sqlite_tables(conn):
             per_query_json TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS eval_items (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id         INTEGER NOT NULL,
+            item_id        TEXT,
+            status         TEXT NOT NULL,
+            error_category TEXT,
+            error_detail   TEXT,
+            result_json    TEXT NOT NULL,
+            created_at     TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_eval_items_run_id ON eval_items(run_id);
+
         CREATE TABLE IF NOT EXISTS brd_validation_runs (
             id             INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp      TEXT NOT NULL,
@@ -115,6 +142,22 @@ def _init_sqlite_tables(conn):
             prev_hash     TEXT NOT NULL,
             record_hash   TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS calibrations (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            status        TEXT NOT NULL,
+            threshold     TEXT,
+            alpha         REAL NOT NULL,
+            n             INTEGER NOT NULL,
+            dataset_path  TEXT,
+            run_label     TEXT,
+            coverage_note TEXT,
+            record_json   TEXT NOT NULL,
+            timestamp     TEXT NOT NULL,
+            chain_index   INTEGER NOT NULL,
+            prev_hash     TEXT NOT NULL,
+            record_hash   TEXT NOT NULL
+        );
     """)
 
     # Tamper-evident audit chain columns (added via ALTER so existing DBs upgrade).
@@ -123,6 +166,31 @@ def _init_sqlite_tables(conn):
     _ensure_column(conn, "audit_logs", "prev_hash", "TEXT")
     _ensure_column(conn, "audit_logs", "record_hash", "TEXT")
     _ensure_column(conn, "audit_logs", "chain_index", "INTEGER")
+
+    # Run-provenance columns (finding #4 — a run used to record nothing about
+    # what produced it). run_config_json is shared/runconfig.py::RunConfig,
+    # captured at run start; corpus_manifest_json is a lightweight snapshot
+    # of list_documents() (not yet the fully content-hashed, versioned
+    # manifest Phase 3/W3.1 will build); active_calibration_json freezes
+    # what should_abstain would have read, at the moment the run started.
+    _ensure_column(conn, "eval_runs", "run_config_json", "TEXT")
+    _ensure_column(conn, "eval_runs", "git_commit", "TEXT")
+    _ensure_column(conn, "eval_runs", "corpus_manifest_json", "TEXT")
+    _ensure_column(conn, "eval_runs", "dataset_hash", "TEXT")
+    _ensure_column(conn, "eval_runs", "active_calibration_json", "TEXT")
+    _ensure_column(conn, "eval_runs", "model_identities_json", "TEXT")
+    _ensure_column(conn, "eval_runs", "status", "TEXT")
+    _ensure_column(conn, "eval_runs", "eval_mode", "INTEGER")
+    _ensure_column(conn, "eval_runs", "parent_run_id", "INTEGER")
+    _ensure_column(conn, "eval_runs", "error", "TEXT")
+
+    # Corpus-identity columns (W3.1). Without the source hash there is no way
+    # to prove the PDF behind a labeled corpus is the same bytes it was at
+    # label time; `parser_version` pins the chunker that produced the
+    # chunk_keys those labels point at.
+    _ensure_column(conn, "documents", "source_sha256", "TEXT")
+    _ensure_column(conn, "documents", "source_path", "TEXT")
+    _ensure_column(conn, "documents", "parser_version", "TEXT")
 
     conn.commit()
 
@@ -138,12 +206,39 @@ def get_sqlite_connection():
 
 # ── SQLite Helper Functions ─────────────────────────────────
 
-def insert_document(filename, publication_name, edition_date, chunk_count, structured: bool = True):
+def upsert_document(filename, publication_name, edition_date, chunk_count,
+                    structured: bool = True, source_sha256: str = "",
+                    source_path: str = "", parser_version: str = ""):
+    """Insert or refresh the row for a (publication_name, edition_date) pair.
+
+    This replaces an unconditional-INSERT helper: re-ingesting a document
+    left two rows with the same identity and different chunk_counts — and
+    `list_documents()` returned both, double-counting the corpus in every
+    provenance snapshot. A document's identity is its (publication, edition)
+    slice, matching how ingestion keys chunks and how retrieval filters them.
+    """
     conn = get_sqlite_connection()
     try:
+        row = conn.execute(
+            "SELECT id FROM documents WHERE publication_name = ? AND edition_date = ?",
+            (publication_name, edition_date),
+        ).fetchone()
+        if row:
+            conn.execute(
+                """UPDATE documents SET filename = ?, chunk_count = ?, ingested_at = ?,
+                   structured = ?, source_sha256 = ?, source_path = ?, parser_version = ?
+                   WHERE id = ?""",
+                (filename, chunk_count, _utcnow_iso(), int(structured),
+                 source_sha256, source_path, parser_version, row["id"]),
+            )
+            conn.commit()
+            return row["id"]
         cursor = conn.execute(
-            "INSERT INTO documents (filename, publication_name, edition_date, chunk_count, ingested_at, structured) VALUES (?, ?, ?, ?, ?, ?)",
-            (filename, publication_name, edition_date, chunk_count, datetime.now().isoformat(), int(structured)),
+            """INSERT INTO documents (filename, publication_name, edition_date, chunk_count,
+               ingested_at, structured, source_sha256, source_path, parser_version)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (filename, publication_name, edition_date, chunk_count, _utcnow_iso(),
+             int(structured), source_sha256, source_path, parser_version),
         )
         conn.commit()
         return cursor.lastrowid
@@ -160,9 +255,29 @@ def list_documents():
         conn.close()
 
 
+def list_latest_documents():
+    """One row per (publication_name, edition_date) — the most recent ingest.
+
+    Everything that reasons about "what is in the corpus" (provenance
+    snapshots, the corpus manifest) must use this rather than
+    `list_documents()`, which still returns historical duplicate rows written
+    before `upsert_document` existed.
+    """
+    conn = get_sqlite_connection()
+    try:
+        rows = conn.execute(
+            """SELECT * FROM documents WHERE id IN (
+                   SELECT MAX(id) FROM documents GROUP BY publication_name, edition_date
+               ) ORDER BY ingested_at DESC"""
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
 def list_documents_with_sections():
     collection = get_chroma_collection()
-    docs       = list_documents()
+    docs       = list_latest_documents()
     result     = []
     for doc in docs:
         pub   = doc["publication_name"]
@@ -193,7 +308,7 @@ def insert_audit_log(query, response_json, trust_gate_status=""):
     try:
         cursor = conn.execute(
             "INSERT INTO audit_logs (timestamp, query, response_json, trust_gate_status) VALUES (?, ?, ?, ?)",
-            (datetime.now().isoformat(), query, response_json, trust_gate_status),
+            (_utcnow_iso(), query, response_json, trust_gate_status),
         )
         conn.commit()
         return cursor.lastrowid
@@ -226,17 +341,49 @@ def get_sqlite_conn():
 
 
 # ── Eval Run Helpers ─────────────────────────────────────────
+# insert_eval_run_started() / finalize_eval_run() replace the old one-shot
+# insert_eval_run() — a run row is now created BEFORE execution (status
+# "running") and finalized in a finally-block by the caller (eval/routes.py),
+# so a crash/timeout mid-run leaves a "failed"/"running" row behind instead
+# of no record at all (finding #8). Per-item durability is eval_items, below.
 
-def insert_eval_run(run_label, dataset_path, started_at, finished_at, num_queries, metrics_json, per_query_json):
+def insert_eval_run_started(
+    run_label, dataset_path, started_at,
+    run_config_json=None, git_commit=None, corpus_manifest_json=None,
+    dataset_hash=None, active_calibration_json=None, model_identities_json=None,
+    eval_mode=None, parent_run_id=None,
+):
     conn = get_sqlite_connection()
     try:
         cursor = conn.execute(
-            "INSERT INTO eval_runs (run_label, dataset_path, started_at, finished_at, num_queries, metrics_json, per_query_json) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (run_label, dataset_path, started_at, finished_at, num_queries, metrics_json, per_query_json),
+            "INSERT INTO eval_runs "
+            "(run_label, dataset_path, started_at, status, run_config_json, git_commit, "
+            " corpus_manifest_json, dataset_hash, active_calibration_json, model_identities_json, "
+            " eval_mode, parent_run_id) "
+            "VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                run_label, dataset_path, started_at, run_config_json, git_commit,
+                corpus_manifest_json, dataset_hash, active_calibration_json, model_identities_json,
+                int(eval_mode) if eval_mode is not None else None, parent_run_id,
+            ),
         )
         conn.commit()
         return cursor.lastrowid
+    finally:
+        conn.close()
+
+
+def finalize_eval_run(run_id, status, finished_at, num_queries=None, metrics_json=None, per_query_json=None, error=None):
+    """Mark a run 'complete' or 'failed' and attach its final metrics.
+    Called from a finally-block by the route, so a run started via
+    insert_eval_run_started() is never left silently in 'running' state."""
+    conn = get_sqlite_connection()
+    try:
+        conn.execute(
+            "UPDATE eval_runs SET status=?, finished_at=?, num_queries=?, metrics_json=?, per_query_json=?, error=? WHERE id=?",
+            (status, finished_at, num_queries, metrics_json, per_query_json, error, run_id),
+        )
+        conn.commit()
     finally:
         conn.close()
 
@@ -245,7 +392,7 @@ def list_eval_runs():
     conn = get_sqlite_connection()
     try:
         rows = conn.execute(
-            "SELECT id, run_label, dataset_path, started_at, finished_at, num_queries, metrics_json "
+            "SELECT id, run_label, dataset_path, started_at, finished_at, num_queries, metrics_json, status, git_commit "
             "FROM eval_runs ORDER BY id DESC"
         ).fetchall()
         return [dict(row) for row in rows]
@@ -262,6 +409,51 @@ def get_eval_run(run_id: int):
         conn.close()
 
 
+# ── Eval Item Helpers (per-item durability, finding #8) ──────
+# One row per item, written the moment it completes — a crash at item 299 of
+# 300 leaves the first 298 permanently on disk, unlike the old design where
+# the whole run's results lived only in memory until the final aggregate step.
+
+def insert_eval_item(run_id: int, item_id, status: str, error_category, error_detail, result_json: str) -> int:
+    conn = get_sqlite_connection()
+    try:
+        cursor = conn.execute(
+            "INSERT INTO eval_items (run_id, item_id, status, error_category, error_detail, result_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (run_id, str(item_id) if item_id is not None else None, status, error_category, error_detail, result_json, _utcnow_iso()),
+        )
+        conn.commit()
+        return cursor.lastrowid
+    finally:
+        conn.close()
+
+
+def list_eval_items(run_id: int) -> list:
+    conn = get_sqlite_connection()
+    try:
+        rows = conn.execute(
+            "SELECT id, run_id, item_id, status, error_category, error_detail, result_json, created_at "
+            "FROM eval_items WHERE run_id = ? ORDER BY id ASC",
+            (run_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def get_completed_item_ids(run_id: int) -> set:
+    """Item ids already persisted for this run — what resume_run skips."""
+    conn = get_sqlite_connection()
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT item_id FROM eval_items WHERE run_id = ? AND item_id IS NOT NULL",
+            (run_id,),
+        ).fetchall()
+        return {row["item_id"] for row in rows}
+    finally:
+        conn.close()
+
+
 # ── BRD Validation Run Helpers (server-side history, not localStorage) ──────
 
 def insert_brd_validation_run(source_filename, requirements_json, results_json, overall_score):
@@ -270,7 +462,7 @@ def insert_brd_validation_run(source_filename, requirements_json, results_json, 
         cursor = conn.execute(
             "INSERT INTO brd_validation_runs (timestamp, source_filename, requirements_json, results_json, overall_score) "
             "VALUES (?, ?, ?, ?, ?)",
-            (datetime.now().isoformat(), source_filename, requirements_json, results_json, overall_score),
+            (_utcnow_iso(), source_filename, requirements_json, results_json, overall_score),
         )
         conn.commit()
         return cursor.lastrowid
@@ -386,7 +578,7 @@ def insert_review_action(audit_log_id: int, reviewer: str, action: str, note: st
         ).fetchone()
         prev_row = {"record_hash": row["record_hash"], "chain_index": row["chain_index"]} if row else None
         prev_hash, chain_index = next_link(prev_row)
-        ts = datetime.now().isoformat()
+        ts = _utcnow_iso()
         payload = {
             "audit_log_id": audit_log_id, "reviewer": reviewer,
             "action": action, "note": note, "timestamp": ts,
@@ -470,6 +662,83 @@ def iter_review_chain() -> list:
                 "audit_log_id": r["audit_log_id"], "reviewer": r["reviewer"],
                 "action": r["action"], "note": r["note"], "timestamp": r["timestamp"],
             },
+        } for r in rows]
+    finally:
+        conn.close()
+
+
+# ── Conformal calibration history (own tamper-evident chain) ────────────────
+# Closes the one gap where governance state (the abstention threshold in
+# force) lived outside the tamper-evident chain — previously a single
+# overwritten JSON file with no history and no way to prove it wasn't
+# quietly edited.
+
+def insert_calibration_record(calibration: dict) -> dict:
+    """Append a hash-chained conformal calibration record — every attempt
+    (NO_DATA / INSUFFICIENT_N / CALIBRATED alike), not just ones that became
+    the active threshold. Append-only, independent of the JSON pointer file."""
+    conn = get_sqlite_connection()
+    try:
+        row = conn.execute(
+            "SELECT record_hash, chain_index FROM calibrations "
+            "WHERE chain_index IS NOT NULL ORDER BY chain_index DESC LIMIT 1"
+        ).fetchone()
+        prev_row = {"record_hash": row["record_hash"], "chain_index": row["chain_index"]} if row else None
+        prev_hash, chain_index = next_link(prev_row)
+        ts = _utcnow_iso()
+        payload = dict(calibration)
+        payload.setdefault("recorded_at", ts)
+        record_hash = compute_record_hash(payload, prev_hash)
+
+        thr = payload.get("threshold")
+        thr_stored = "inf" if thr == float("inf") else ("" if thr is None else str(thr))
+
+        cur = conn.execute(
+            "INSERT INTO calibrations "
+            "(status, threshold, alpha, n, dataset_path, run_label, coverage_note, record_json, timestamp, chain_index, prev_hash, record_hash) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                payload.get("status", ""), thr_stored, payload.get("alpha"), payload.get("n"),
+                payload.get("dataset_path", ""), payload.get("run_label", ""), payload.get("coverage_note", ""),
+                json.dumps(payload, default=str), ts, chain_index, prev_hash, record_hash,
+            ),
+        )
+        conn.commit()
+        return {
+            "id": cur.lastrowid, "chain_index": chain_index,
+            "prev_hash": prev_hash, "record_hash": record_hash, **payload,
+        }
+    finally:
+        conn.close()
+
+
+def list_calibration_records() -> list:
+    """All calibration attempts, oldest first (chain order)."""
+    conn = get_sqlite_connection()
+    try:
+        rows = conn.execute(
+            "SELECT id, status, threshold, alpha, n, dataset_path, run_label, coverage_note, timestamp, chain_index, prev_hash, record_hash "
+            "FROM calibrations WHERE chain_index IS NOT NULL ORDER BY chain_index ASC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def iter_calibration_chain() -> list:
+    """All calibration records in chain order, shaped for audit_chain.verify_chain."""
+    conn = get_sqlite_connection()
+    try:
+        rows = conn.execute(
+            "SELECT id, record_json, timestamp, chain_index, prev_hash, record_hash "
+            "FROM calibrations WHERE chain_index IS NOT NULL ORDER BY chain_index ASC"
+        ).fetchall()
+        return [{
+            "id": r["id"],
+            "chain_index": r["chain_index"],
+            "prev_hash": r["prev_hash"],
+            "record_hash": r["record_hash"],
+            "record": json.loads(r["record_json"]),
         } for r in rows]
     finally:
         conn.close()

@@ -1,10 +1,10 @@
 """
 stability.py — Paraphrase / self-consistency stability check.
 
-Only triggers a second Gemini generation when the primary answer's trust
+Only triggers a second LLM generation when the primary answer's trust
 status isn't already SAFE (bounds cost/latency — most queries never pay for
 this). The *comparison* between the two samples is pure NLI claim-agreement
-via the already-loaded CrossEncoder — Gemini's role is strictly "generate a
+via the already-loaded CrossEncoder — the LLM's role is strictly "generate a
 second sample," never "judge whether they agree." Consistent with the
 project's "LLM extracts, Math judges" rule: no LLM-as-judge.
 
@@ -18,12 +18,13 @@ actual factual drift between the two samples instead.
 import logging
 from typing import List
 
+from shared import config
 from shared.models import Claim, TrustStatus
 from shared.xai_matrices import get_nli, extract_relevant_sentences, NLI_PREPROCESS_AT
 
 logger = logging.getLogger(__name__)
 
-STABILITY_TEMPERATURE = 0.7
+STABILITY_TEMPERATURE = config.STABILITY_TEMPERATURE
 
 
 async def compute_paraphrase_stability(

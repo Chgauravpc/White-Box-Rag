@@ -18,7 +18,7 @@ from datetime import datetime
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from shared.config import MAX_COLLECTION_LABEL_LENGTH
-from shared.database import get_chroma_collection, list_documents
+from shared.database import get_chroma_collection, list_latest_documents
 from shared.models import (
     DocumentInfo,
     QueryRequest,
@@ -146,7 +146,7 @@ async def query_documents(request: QueryRequest):
 @router.get("/documents", response_model=list[DocumentInfo])
 async def get_documents():
     """List all ingested documents with metadata."""
-    docs = list_documents()
+    docs = list_latest_documents()
     return [DocumentInfo(**doc) for doc in docs]
 
 

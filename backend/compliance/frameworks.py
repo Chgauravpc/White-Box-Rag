@@ -102,7 +102,7 @@ FRAMEWORKS = [
                 "title": "Measurement & evaluation",
                 "requirement": "Quantitatively and qualitatively analyze and track risk.",
                 "satisfied_by": ["Trust Scorecard", "Eval harness", "Latency/cost tracking", "Conformal coverage"],
-                "evidence": ["faithfulness_raw vs post", "p50/p95 latency + Gemini call counts", "Calibrated coverage target"],
+                "evidence": ["faithfulness_raw vs post", "p50/p95 latency + LLM call counts", "Calibrated coverage target"],
                 "status": "satisfied",
                 "page": "views/evaluation.py",
             },

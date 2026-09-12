@@ -7,24 +7,28 @@ from shared.xai_matrices import verify_claims_batch, build_entailment_matrix
 
 async def verify_all_claims(
     claims: List[Claim],
-) -> Tuple[List[VerificationResult], np.ndarray, List[str]]:
+) -> Tuple[List[VerificationResult], np.ndarray, List[str], List[List[str]]]:
     """Verifies claims via batched DeBERTa CrossEncoder (Matrix 2).
 
     Returns:
-        (verifications, E_matrix, focused_passages)
+        (verifications, E_matrix, focused_passages, premise_deletions)
         focused_passages[i] is the sentence subset actually fed to NLI for claim i —
         stored in Claim.focused_passage for full audit traceability.
+        premise_deletions[i] is the lines PREMISE_NORMALIZER removed from claim i's
+        source passage before NLI scoring — stored in Claim.premise_deletions so
+        premise mutation is auditable rather than invisible.
     """
     if not claims:
-        return [], np.array([]), []
+        return [], np.array([]), [], []
 
     pairs = [(claim.text, claim.source_passage) for claim in claims]
 
     # Batched NLI — also applies extract_relevant_sentences() internally
     raw_results = verify_claims_batch(pairs)
 
-    verifications    = []
-    focused_passages = []
+    verifications     = []
+    focused_passages  = []
+    premise_deletions = []
     for claim, result in zip(claims, raw_results):
         verifications.append(
             VerificationResult(
@@ -40,6 +44,7 @@ async def verify_all_claims(
             )
         )
         focused_passages.append(result.get("focused_passage", claim.source_passage))
+        premise_deletions.append(result.get("premise_deletions", []))
 
     # Build full E matrix for XAI visualization
     claim_texts = [c.text for c in claims]
@@ -49,4 +54,4 @@ async def verify_all_claims(
     else:
         E_matrix = np.array([])
 
-    return verifications, E_matrix, focused_passages
+    return verifications, E_matrix, focused_passages, premise_deletions

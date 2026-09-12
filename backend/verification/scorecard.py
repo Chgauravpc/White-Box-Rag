@@ -20,7 +20,7 @@ def generate_scorecard(
     A pure aggregator — every metric here is either computed inline from
     `verifications`/`claims`/`retrieval_scores`, or passed in already-computed
     from the caller (paraphrase_stability, answer_relevancy, context_utilization,
-    context_diversity all require the encoder/NLI models or a second Gemini
+    context_diversity all require the encoder/NLI models or a second LLM
     sample, which the caller — ingestion/pipeline.py — already has in scope).
 
     `retrieval_scores`/`context_*` args are optional because the standalone

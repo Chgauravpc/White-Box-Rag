@@ -25,6 +25,9 @@ from eval.routes import router as eval_router
 # Governance — Human-in-the-loop review
 from governance.routes import router as governance_router
 
+# LLM pool observability (Phase 2)
+from shared.llm_routes import router as llm_router
+
 # ──────────────────────────────────────────────
 #  Logging
 # ──────────────────────────────────────────────
@@ -63,6 +66,7 @@ app.include_router(compliance_router, prefix="/api")
 app.include_router(verification_router, prefix="/api")
 app.include_router(eval_router, prefix="/api")
 app.include_router(governance_router, prefix="/api")
+app.include_router(llm_router, prefix="/api")
 
 
 # ──────────────────────────────────────────────

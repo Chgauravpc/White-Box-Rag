@@ -4,7 +4,7 @@ A **domain-agnostic, compliance-grade governance layer** that sits on top of any
 
 The core idea: **the retrieval, ranking, conflict-detection, and trust-scoring layers use pure linear algebra and deterministic rules — no LLM in the verification loop.** That makes every governance decision reconstructible, explainable, and repeatable.
 
-> Built as a hackathon project; the reference domain is RBI banking-compliance (mapping a Business Requirements Document against regulatory circulars), but the framework works on any document corpus.
+> Built as a hackathon project; the framework is domain-agnostic by design — ingestion accepts any free-text collection label, and both the NLI-premise normalization and the compliance-prompt persona are swappable domain profiles (`generic` by default; a `financial_reports` profile preserves the original RBI banking-compliance behavior for continuity). See `backend/shared/text_normalize.py` and `backend/compliance/domain_profiles.py`.
 
 ---
 
@@ -86,11 +86,13 @@ On top of the trust layer, five features make the system defensible to an audito
 
 - **Backend:** Python, FastAPI
 - **Retrieval:** ChromaDB (dense), `rank-bm25` (sparse), Reciprocal Rank Fusion
-- **Embeddings:** `all-MiniLM-L6-v2` (384-dim, sentence-transformers)
-- **Generation & NLI:** Google Gemini
+- **Embeddings:** `all-MiniLM-L6-v2` (384-dim, sentence-transformers) for retrieval; `BAAI/bge-large-en-v1.5` (1024-dim) for attribution/similarity scoring — deliberately independent models, both configurable/pinnable, see [`docs/BENCHMARK_READINESS.md`](docs/BENCHMARK_READINESS.md)
+- **NLI Verification:** `cross-encoder/nli-deberta-v3-base` (local, sentence-transformers)
+- **Generation:** Groq or OpenRouter (config-driven, OpenAI-compatible API), behind a multi-key/multi-provider pool with TPM-aware admission and failover (`backend/shared/llm_pool.py`) plus record/replay cassettes for reproducible/offline runs (`backend/shared/llm_cassette.py`) — see [`docs/BENCHMARK_READINESS.md`](docs/BENCHMARK_READINESS.md)'s Phase 2
 - **Storage / Audit:** SQLite
 - **Frontend:** Streamlit dashboard
-- **Evaluation:** RAGAS-style offline harness
+- **Evaluation:** RAGAS-style offline harness + label-vs-prediction accuracy scoring (`backend/eval/scoring.py`) — precision/recall/F1/nDCG/AUROC, each with a confidence interval
+- **CI:** GitHub Actions (`.github/workflows/tests.yml`) — the full test suite on every push/PR
 
 ---
 
@@ -101,8 +103,8 @@ White Box RAG/
 ├── backend/
 │   ├── gateway.py                 # FastAPI entrypoint — mounts all routers under /api
 │   ├── ingestion/                 # BP1: PDF parsing, chunking, hybrid retrieval, RAG generation
-│   │   ├── pdf_parser.py
-│   │   ├── pipeline.py
+│   │   ├── pdf_parser.py          # section detection + chunking; emits canonical chunk_key
+│   │   ├── pipeline.py            # canonical /query orchestration
 │   │   ├── retriever.py           # dense + BM25 + RRF fusion
 │   │   └── rag.py                 # answer generation + claim parsing
 │   ├── verification/              # BP2: trust & hallucination detection
@@ -111,21 +113,40 @@ White Box RAG/
 │   │   ├── edition_conflict.py    # cross-edition conflict detection
 │   │   ├── trust_gate.py          # Shapley-style trust gate
 │   │   ├── stability.py
-│   │   ├── mitigation.py          # claim filtering + abstention
+│   │   ├── mitigation.py          # claim filtering + abstention + nonconformity_score
 │   │   ├── counterfactual.py      # "what would change the verdict" (Governance)
 │   │   └── conformal.py           # split-conformal abstention calibration (Governance)
 │   ├── compliance/                # BP3: BRD mapping, gap analysis, audit
 │   │   ├── brd_parser.py
 │   │   ├── mapper.py              # requirement → corpus alignment scoring
 │   │   ├── audit.py               # JSON audit report → SQLite
-│   │   └── frameworks.py          # EU AI Act / NIST AI RMF control catalog (Governance)
+│   │   ├── frameworks.py          # EU AI Act / NIST AI RMF control catalog (Governance)
+│   │   └── domain_profiles.py     # swappable persona/vocabulary (generic default; financial_reports)
 │   ├── governance/                # HITL review queue router (Governance)
 │   ├── eval/                      # offline evaluation harness + conformal calibration
-│   └── shared/                    # config, DB, Gemini client, XAI matrices, models
-│       └── audit_chain.py         # tamper-evident hash-chain primitives (Governance)
+│   │   ├── harness.py             # run_eval / run_calibration
+│   │   ├── scoring.py             # label-vs-prediction accuracy: P/R/F1/nDCG/AUROC + CIs
+│   │   └── schema.py              # dataset v2 shape + validator + v1 compatibility loader
+│   ├── scripts/                   # manual, live-credential operator tools (never pytest-collected)
+│   └── shared/                    # config, DB, LLM client (Groq/OpenRouter), XAI matrices, models
+│       ├── audit_chain.py         # tamper-evident hash-chain primitives (Governance)
+│       ├── chunk_key.py           # canonical globally-unique chunk identity
+│       ├── corpus_manifest.py    # frozen content-hashed corpus snapshot + drift diff (W3.1)
+│       ├── hashing.py            # file/text content-hash primitives
+│       ├── text_normalize.py      # profile-based NLI premise normalization (generic default)
+│       ├── runconfig.py           # frozen run-configuration snapshot (provenance)
+│       ├── config.py              # every threshold/temperature/model identity, env-overridable
+│       ├── llm.py                 # call_llm()/call_llm_meta() — public LLM entry point (Phase 2)
+│       ├── llm_pool.py            # multi-key/multi-provider pool: admission, failover, error classification
+│       ├── llm_pool_config.py     # pool topology from env (key lists, provider order, rate limits)
+│       ├── llm_cassette.py        # record/replay cassettes (LLM_MODE=record|replay)
+│       └── llm_routes.py          # GET /api/llm/pool — live per-endpoint health/headroom
 ├── streamlit_app/                 # Streamlit UI (ingest, query, verify, compliance,
 │                                  #   audit, review queue, regulatory mapping, eval)
-├── docs/GOVERNANCE.md             # governance suite documentation
+├── .github/workflows/tests.yml    # CI: full test suite on every push/PR
+├── docs/
+│   ├── GOVERNANCE.md              # governance suite documentation
+│   └── BENCHMARK_READINESS.md     # benchmark-readiness roadmap + progress log
 ├── xai_math_spec.md               # full mathematical specification
 └── requirements.txt
 ```
@@ -136,7 +157,7 @@ White Box RAG/
 
 ### 1. Prerequisites
 - Python 3.10+
-- A Google Gemini API key
+- A Groq API key (free tier at [console.groq.com](https://console.groq.com)) and/or an OpenRouter API key
 
 ### 2. Setup
 
@@ -149,7 +170,7 @@ python -m venv .venv
 
 pip install -r requirements.txt
 
-cp .env.example .env      # then add your GEMINI_API_KEY
+cp .env.example .env      # then set LLM_PROVIDER (groq|openrouter) and the matching API key
 ```
 
 ### 3. Run the backend
@@ -181,7 +202,8 @@ All routes are mounted under `/api`:
 | **Verification** | Verify claims, score faithfulness, run the trust gate |
 | **Compliance** | Map requirements to the corpus, produce gap/violation analysis and audit reports; `GET /api/audit/verify-integrity` (chain check), `GET /api/compliance/frameworks` (regulatory mapping) |
 | **Governance** | HITL review of flagged audits: `GET /api/review/queue`, `POST /api/review/{id}/resolve`, `GET /api/review/{id}/history` |
-| **Eval** | Run the offline harness; `POST /api/eval/calibrate` + `GET /api/eval/calibration` (conformal abstention) |
+| **Eval** | Run the offline harness; `POST /api/eval/calibrate` (`force?`) + `GET /api/eval/calibration` (conformal abstention, reports `status`/`effective`) |
+| **LLM pool** | `GET /api/llm/pool` — live per-endpoint health/headroom snapshot (never the raw key, only its fingerprint) |
 
 See the interactive OpenAPI docs at `/docs` for full request/response schemas.
 
@@ -193,6 +215,16 @@ See the interactive OpenAPI docs at `/docs` for full request/response schemas.
 cd backend
 pytest
 ```
+
+280 tests, entirely against mocked ML models (`backend/conftest.py`) and a fake `AsyncOpenAI` client (`backend/tests/test_llm_pool.py`) — no API key or model download needed. Runs automatically on every push/PR via `.github/workflows/tests.yml`.
+
+---
+
+## Benchmark Readiness
+
+This project is mid-way through a self-directed benchmark-readiness effort: an independent review audited the eval harness against the standard of "can we credibly publish a hallucination-detection/retrieval number," found 22 issues (from "the harness never compares a prediction to a label" to a conformal-calibration fail-open bug), and a phased roadmap was built to close them — reproducibility, an external-benchmark-ready detector plane, a multi-provider key pool, and CI gating.
+
+**Progress and the full roadmap:** [`docs/BENCHMARK_READINESS.md`](docs/BENCHMARK_READINESS.md).
 
 ---
 

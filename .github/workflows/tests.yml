@@ -1,0 +1,59 @@
+name: Tests
+
+# W0.4 of the benchmark-readiness roadmap: a cheap CI skeleton. The 165
+# backend tests run entirely against mocked ML models (see
+# backend/conftest.py) and never call a live LLM — no API keys are needed
+# here, and none are configured as secrets. This is intentionally minimal;
+# it establishes the runner/caching config that later CI phases (offline
+# retrieval/detector planes, record/replay cassettes, nightly live
+# calibration runs) build on rather than reinvent.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r ../requirements.txt
+
+      - name: Run pytest
+        env:
+          # Satisfies shared/config.py's presence check; conftest.py mocks
+          # every ML model, and no test in this suite makes a live LLM call.
+          GROQ_API_KEY: ci-placeholder-not-used
+        run: pytest -q
+
+  lint:
+    runs-on: ubuntu-latest
+    # Informational only for now: this codebase predates ruff adoption and
+    # currently has ~18 pre-existing unused-import findings unrelated to any
+    # single change. Tightening this to a blocking gate (and clearing the
+    # backlog) is a deliberate follow-up, not an oversight — see docs/GOVERNANCE.md.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install ruff
+        run: pip install ruff
+      - name: "Ruff check (real-bug rules only: syntax errors + pyflakes)"
+        run: ruff check backend --select E9,F --exclude backend/scripts

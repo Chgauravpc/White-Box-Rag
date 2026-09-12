@@ -1,6 +1,6 @@
 # Governance Suite
 
-Five features that make White-Box RAG defensible to an auditor or regulator, not just observable. They build on the existing trust/verification layer and stay **pure-math** — Gemini generates and extracts; math judges. Nothing here adds an LLM to the decision loop.
+Five features that make White-Box RAG defensible to an auditor or regulator, not just observable. They build on the existing trust/verification layer and stay **pure-math** — the LLM (Groq or OpenRouter) generates and extracts; math judges. Nothing here adds an LLM to the decision loop.
 
 The through-line: a decision is **explainable** (counterfactuals), **statistically defensible** (conformal abstention), **routed to a human when uncertain** (review queue), **cryptographically un-tamperable** (hash-chained audit log), and **mapped to law** (EU AI Act / NIST AI RMF).
 
@@ -9,7 +9,7 @@ The through-line: a decision is **explainable** (counterfactuals), **statistical
 | Tamper-evident audit log | Governance | `GET /api/audit/verify-integrity` | Audit Trail |
 | Human-in-the-loop review queue | Responsible / Governance | `GET /api/review/queue`, `POST /api/review/{id}/resolve`, `GET /api/review/{id}/history` | Review Queue, Audit Trail |
 | Counterfactual explanations | Explainability | *(on `/api/query` response)* | RAG Query, Audit Trail |
-| Conformal abstention | Responsible | `POST /api/eval/calibrate`, `GET /api/eval/calibration` | Evaluation |
+| Conformal abstention | Responsible | `POST /api/eval/calibrate` (`force?`), `GET /api/eval/calibration` (`status`, `effective`) | Evaluation |
 | EU AI Act / NIST AI RMF mapping | Governance | `GET /api/compliance/frameworks` | Regulatory Mapping |
 
 ---
@@ -32,7 +32,9 @@ record_hash = sha256( prev_hash + canonical_json(record) )
 
 `reason` is `content_tampered` (a record's payload was altered) or `broken_linkage` (a record was deleted or reordered).
 
-**Concurrency.** The eval harness fans out `/query` under `asyncio.Semaphore(3)`. A naïve "read last hash → compute → write" would let two concurrent finalizes read the same predecessor and fork the chain. Finalization is guarded by a module `asyncio.Lock`, and an explicit `chain_index` (assigned under the lock) — not the row `id` — defines chain order, so out-of-order finalization is safe.
+**Concurrency.** The eval harness fans out `/query` under `asyncio.Semaphore(EVAL_CONCURRENCY)` (default 3, `shared/config.py`). A naïve "read last hash → compute → write" would let two concurrent finalizes read the same predecessor and fork the chain. Finalization is guarded by a module `asyncio.Lock`, and an explicit `chain_index` (assigned under the lock) — not the row `id` — defines chain order, so out-of-order finalization is safe.
+
+**Benchmark runs never touch this chain.** `eval/harness.py` runs the pipeline with `eval_mode=True` by default, which skips audit-report generation entirely (see [`docs/BENCHMARK_READINESS.md`](BENCHMARK_READINESS.md)'s W1.2 entry) — so a 300-item benchmark run doesn't write 300 rows into the same tamper-evident chain your production queries use. The live `/query` route is unaffected; this only applies to the offline harness.
 
 **Bonus fix.** The live audit write (`compliance/audit.py`) previously persisted only a *partial* report; the scorecard/XAI/faithfulness fields were assembled later in the pipeline and returned in-memory only, never saved. Finalization now overwrites `audit_data_json` with the **complete** record — so the Audit Trail detail view finally reads back the full scorecard it renders.
 
@@ -77,16 +79,20 @@ Edition conflicts pass through unchanged to each recomputation — removing a cl
 
 **Problem.** Abstention used a hand-tuned constant (`ABSTENTION_MEAN_PENALTY_CEIL = 0.25`) — a guess, with no statistical meaning.
 
-**Solution.** Calibrate the threshold to a **risk target** via split conformal prediction. The nonconformity score is the retained-set mean penalty (what `should_abstain` already compares). Calibrating on items labelled *answerable*, the `⌈(n+1)(1-α)⌉`-th smallest score becomes the threshold, so **at most ~α of truly-answerable queries are wrongly abstained** (marginal coverage on the answerable set).
+**Solution.** Calibrate the threshold to a **risk target** via split conformal prediction. The nonconformity score is the retained-set mean penalty (`verification/mitigation.py::nonconformity_score` — the exact quantity `should_abstain` compares against the threshold; the eval harness's calibration pipeline calls this same function rather than reconstructing an approximation, so the two can never diverge). Calibrating on items labelled *answerable*, the `⌈(n+1)(1-α)⌉`-th smallest score becomes the threshold, so **at most ~α of truly-answerable queries are wrongly abstained** (marginal coverage on the answerable set) — **when there is enough calibration data.**
 
-- `POST /api/eval/calibrate` — body `{ alpha, dataset_path? }`; runs the labelled set through the live pipeline and persists the threshold.
-- `GET  /api/eval/calibration` — the active threshold, α, n, and coverage note.
+- `POST /api/eval/calibrate` — body `{ alpha, dataset_path?, force? }`; runs the labelled set through the live pipeline and, if the result is usable, persists the threshold.
+- `GET  /api/eval/calibration` — the stored calibration, its `status`, and whether it's actually `effective` right now.
 
-Wiring is **non-breaking**: `should_abstain` prefers the calibrated threshold and falls back to the fixed ceiling when none is set, so behaviour is identical until you calibrate.
+Wiring is **non-breaking**: `should_abstain` prefers the calibrated threshold and falls back to the fixed ceiling when none is active, so behaviour is identical until you calibrate.
 
-> **Honest scoping.** This is split conformal for a binary answer/abstain decision — **not** a per-token guarantee. The shipped `calibration_dataset.jsonl` is a demo starter; a production threshold needs a real labelled set over *your* corpus, and calibration runs the live pipeline (needs a Gemini key + ingested docs), so it is an operator action, not a CI step.
+> **Fixed: the fail-open bug.** Every calibration now carries an explicit `status` — `NO_DATA`, `INSUFFICIENT_N`, or `CALIBRATED`. Previously, a calibration set too small for the requested α produced a mathematical threshold of `+∞` (the conservative "never abstain on this rule" value) — but because `mean_penalty > +∞` is never true, that **silently disabled abstention entirely**, making the "calibrated" system strictly *more* permissive than before calibration. `load_active_threshold()` now returns `None` (triggering the fixed-ceiling fallback) whenever the active calibration's status isn't `CALIBRATED` — including a legacy calibration file saved before `status` existed. `POST /api/eval/calibrate` also pre-flight-checks the dataset's answerable-item count against `min_n_for_alpha(α)` *before* running the live pipeline, and only applies a completed calibration as the active threshold when its status is `CALIBRATED` (or `force: true` is passed explicitly) — an insufficient result is still recorded in history, just never silently promoted to active.
+>
+> **Governance note.** The calibration history is now its own hash-chained SQLite table (`calibrations`, mirroring `review_actions`) — this used to be the one piece of governance state (the abstention threshold in force) living outside the tamper-evident chain, a single overwritten JSON file with no history. Every calibration *attempt*, whatever its status, is now permanently and verifiably recorded (`shared/database.py::insert_calibration_record`, `iter_calibration_chain`).
 
-**Code.** `backend/verification/conformal.py` (pure math + JSON persistence), `backend/eval/harness.py` (`run_calibration`), `backend/verification/mitigation.py` (threshold lookup). **Tests:** `backend/tests/test_conformal.py`.
+> **Honest scoping.** This is split conformal for a binary answer/abstain decision — **not** a per-token guarantee. The shipped `calibration_dataset.jsonl` (8 items, 5 answerable) is a demo starter, well below `min_n_for_alpha(0.1) = 9` — a production threshold needs a real labelled set over *your* corpus, and calibration runs the live pipeline (needs a live LLM API key + ingested docs), so it is an operator action, not a CI step.
+
+**Code.** `backend/verification/conformal.py` (pure math + JSON/SQLite persistence, `CalibrationStatus`, `min_n_for_alpha`), `backend/eval/harness.py` (`run_calibration`), `backend/verification/mitigation.py` (`nonconformity_score`, threshold lookup/injection), `backend/shared/database.py` (`calibrations` chain). **Tests:** `backend/tests/test_conformal.py`, `backend/tests/test_mitigation.py`.
 
 ---
 
@@ -109,7 +115,7 @@ Wiring is **non-breaking**: `should_abstain` prefers the calibrated threshold an
 
 ## Testing
 
-All governance logic is covered by headless unit tests (mocked models, no Gemini):
+All governance logic is covered by headless unit tests (mocked models, no LLM calls):
 
 ```bash
 cd backend
@@ -117,4 +123,4 @@ pytest tests/test_audit_chain.py tests/test_review_chain.py \
        tests/test_counterfactual.py tests/test_conformal.py tests/test_frameworks.py
 ```
 
-The full backend suite (64 tests) runs with a bare `pytest` from `backend/`. The live-pipeline paths (real `/query` chaining, calibration, and the Streamlit pages) require a running backend + `GEMINI_API_KEY` and are verified manually.
+The full backend suite (252 tests) runs with a bare `pytest` from `backend/`, and now runs automatically on every push/PR via `.github/workflows/tests.yml` — entirely against the mocked models in `backend/conftest.py` and a fake `AsyncOpenAI` client (`backend/shared/llm_pool.py`'s tests), no API key or live model download required. The live-pipeline paths (real `/query` chaining, calibration, and the Streamlit pages) still require a running backend plus a live `GROQ_API_KEY` or `OPENROUTER_API_KEY`, and are verified manually — see [`docs/BENCHMARK_READINESS.md`](BENCHMARK_READINESS.md) for the ongoing work to make those paths CI-runnable too. Record/replay cassettes now exist (`backend/shared/llm_cassette.py`, `LLM_MODE=record|replay`) but aren't wired into any CI job yet — that's still manual/operator-driven.

@@ -3,8 +3,9 @@ Tests for pdf_parser.py — section extraction and chunking logic.
 """
 
 import pytest
+from unittest.mock import MagicMock, patch
 
-from ingestion.pdf_parser import chunk_section, detect_sections
+from ingestion.pdf_parser import chunk_section, detect_sections, ingest_pdf
 
 
 # ──────────────────────────────────────────────
@@ -173,3 +174,80 @@ class TestChunkSection:
 
         chunks = chunk_section(section, "FSR", "June 2024")
         assert len(chunks) == 0
+
+
+# ──────────────────────────────────────────────
+#  Chunk Identity Tests (ingest_pdf)
+# ──────────────────────────────────────────────
+
+class TestIngestPdfChunkIdentity:
+    """ingest_pdf must emit a globally-unique chunk_key (not a bare section_id)
+    as both the ChromaDB id and metadata field — the fix for cross-document
+    section_id collisions. I/O (PDF parsing, ChromaDB, SQLite) is mocked;
+    section detection and chunking run for real."""
+
+    def _ingest_with_mocks(self, publication: str, edition: str, page_text: str):
+        fake_pages = [{"page_number": 1, "text": page_text}]
+        fake_collection = MagicMock()
+        with patch("ingestion.pdf_parser.extract_pages", return_value=fake_pages), \
+             patch("ingestion.pdf_parser.get_chroma_collection", return_value=fake_collection), \
+             patch("ingestion.pdf_parser.upsert_document", return_value=1):
+            ingest_pdf("dummy.pdf", publication, edition)
+        return fake_collection
+
+    def test_chunk_key_is_globally_unique_and_stored_in_metadata(self):
+        collection = self._ingest_with_mocks("FSR", "June 2024", "1.1 Overview\nSome section text here.")
+        _, kwargs = collection.upsert.call_args
+        assert kwargs["ids"] == ["FSR|June 2024|1.1|0"]
+        assert kwargs["metadatas"][0]["chunk_key"] == "FSR|June 2024|1.1|0"
+        assert kwargs["metadatas"][0]["section_id"] == "1.1"
+
+    def test_ordinal_is_per_section_not_document_global(self):
+        """chunk_key's ordinal must count within its own section.
+
+        With a document-global counter, section 2's first chunk was ordinal 1
+        (or 47, depending on how much text preceded it), so adding a paragraph
+        to section 1 renumbered every chunk in the document and silently
+        re-pointed every labeled relevant_chunk_key at different text.
+        """
+        collection = self._ingest_with_mocks(
+            "PUB", "2024",
+            "1.1 First\nAlpha content here.\n2.1 Second\nBeta content here.",
+        )
+        ids = collection.upsert.call_args.kwargs["ids"]
+        # Each section restarts at ordinal 0.
+        assert ids == ["PUB|2024|1.1|0", "PUB|2024|2.1|0"]
+
+    def test_earlier_section_growth_does_not_renumber_later_sections(self):
+        """The stability property labels actually depend on."""
+        before = self._ingest_with_mocks(
+            "PUB", "2024", "1.1 First\nAlpha.\n2.1 Second\nBeta content.")
+        after = self._ingest_with_mocks(
+            "PUB", "2024",
+            "1.1 First\nAlpha. " + ("filler words " * 400) + "\n2.1 Second\nBeta content.")
+        keys_before = set(before.upsert.call_args.kwargs["ids"])
+        keys_after = set(after.upsert.call_args.kwargs["ids"])
+        # Section 1.1 grew and gained chunks; 2.1's identity must be untouched.
+        assert "PUB|2024|2.1|0" in keys_before
+        assert "PUB|2024|2.1|0" in keys_after
+
+    def test_reingest_deletes_prior_chunks_before_upsert(self):
+        """Re-ingesting must not leave orphans: `upsert` only overwrites the
+        ids it is given, so a re-parse yielding fewer chunks used to leave the
+        surplus live and retrievable forever."""
+        fake_pages = [{"page_number": 1, "text": "1.1 Overview\nSome text."}]
+        fake_collection = MagicMock()
+        fake_collection.get.return_value = {"ids": ["PUB|2024|9.9|0"]}
+        with patch("ingestion.pdf_parser.extract_pages", return_value=fake_pages), \
+             patch("ingestion.pdf_parser.get_chroma_collection", return_value=fake_collection), \
+             patch("ingestion.pdf_parser.upsert_document", return_value=1):
+            ingest_pdf("dummy.pdf", "PUB", "2024")
+        fake_collection.delete.assert_called_once_with(ids=["PUB|2024|9.9|0"])
+
+    def test_two_documents_sharing_a_section_id_get_distinct_chunk_keys(self):
+        collection_a = self._ingest_with_mocks("DOC_A", "2024", "1.1 Intro\nDocument A content.")
+        collection_b = self._ingest_with_mocks("DOC_B", "2024", "1.1 Intro\nDocument B content.")
+        ids_a = collection_a.upsert.call_args.kwargs["ids"]
+        ids_b = collection_b.upsert.call_args.kwargs["ids"]
+        assert ids_a != ids_b
+        assert set(ids_a).isdisjoint(set(ids_b))

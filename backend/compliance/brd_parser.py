@@ -3,8 +3,10 @@ import json
 import asyncio
 import fitz  # PyMuPDF
 from docx import Document
+from shared import config
 from shared.models import BRDRequirement
-from shared.gemini import call_gemini
+from shared.llm import call_llm
+from compliance.domain_profiles import get_domain_profile
 
 def extract_text_from_file(filepath: str) -> str:
     """Extract text from a PDF, DOCX, or TXT file."""
@@ -33,7 +35,7 @@ def extract_text_from_file(filepath: str) -> str:
 
 async def parse_brd(filepath: str) -> list[BRDRequirement]:
     """
-    Extracts text from a BRD document and uses Gemini 
+    Extracts text from a BRD document and uses the LLM 
     to output structured requirements.
     """
     # 1. Get raw text from document
@@ -41,9 +43,28 @@ async def parse_brd(filepath: str) -> list[BRDRequirement]:
     if not text:
         raise ValueError("No text could be extracted from the document.")
 
-    # 2. Prepare the prompt (as specified by user)
+    # 2. Prepare the prompt — persona/categories/relevance come from the active
+    # domain profile (shared.config.DOMAIN_PROFILE), not a hardcoded domain.
+    profile = get_domain_profile()
+    categories_json = json.dumps(profile["categories"])
+    if profile["relevance_fixed_enum"]:
+        relevance_instruction = (
+            "Choose one or more of:\n    " + json.dumps(profile["relevance_fixed_enum"])
+        )
+        example_2_relevance = json.dumps(profile["relevance_fixed_enum"][:2])
+    else:
+        hint = ", ".join(profile["relevance_hint_examples"])
+        relevance_instruction = (
+            f"A free-text label for the policy/regulation/standard this requirement relates to "
+            f"(examples: {hint}). Use whatever labels actually appear in or are implied by the "
+            f"source document — do not invent a fixed code if none is evident."
+        )
+        example_2_relevance = json.dumps(profile["relevance_hint_examples"][:2])
+    example_category = profile["categories"][0]
+    example_category_2 = profile["categories"][min(4, len(profile["categories"]) - 1)]
+
     prompt = f"""
-You are a financial regulatory analyst specializing in RBI (Reserve Bank of India) compliance.
+{profile["persona"]}
 
 Your task is to extract structured business requirements from a Business Requirements Document (BRD).
 
@@ -62,10 +83,9 @@ Your task is to extract structured business requirements from a Business Require
 - requirement_id: Unique ID in format REQ-001, REQ-002, ...
 - requirement_text: Exact or slightly cleaned version of the requirement
 - category: One of:
-    ["KYC", "Payments", "Lending", "Risk Management", "Reporting", "Compliance", "Fraud Detection", "Customer Onboarding", "Data Security", "Other"]
+    {categories_json}
 
-- regulatory_relevance: Choose one or more of:
-    ["FSR", "MPR", "PSR", "FER"]
+- regulatory_relevance: {relevance_instruction}
 
 4. If a requirement is not clearly regulatory, still include it but classify appropriately.
 
@@ -82,15 +102,15 @@ Example:
 [
   {{
     "requirement_id": "REQ-001",
-    "requirement_text": "System must verify customer identity before account creation",
-    "category": "KYC",
-    "regulatory_relevance": ["PSR"]
+    "requirement_text": "System must verify user identity before granting access",
+    "category": "{example_category}",
+    "regulatory_relevance": {example_2_relevance}
   }},
   {{
     "requirement_id": "REQ-002",
-    "requirement_text": "All transactions must be logged for audit purposes",
-    "category": "Reporting",
-    "regulatory_relevance": ["FSR", "PSR"]
+    "requirement_text": "All actions must be logged for audit purposes",
+    "category": "{example_category_2}",
+    "regulatory_relevance": {example_2_relevance}
   }}
 ]
 
@@ -108,10 +128,10 @@ Example:
 - Ensure IDs are sequential
 """
 
-    # 3. Call Gemini (BP3 uses Gemini to structure)
-    response_text = await call_gemini(prompt, temperature=0.1)
+    # 3. Call the LLM (BP3 uses it to structure the extracted requirements)
+    response_text = await call_llm(prompt, temperature=config.COMPLIANCE_TEMPERATURE)
 
-    # Clean up markdown if Gemini includes it despite our instruction
+    # Clean up markdown if the model includes it despite our instruction
     response_text = response_text.strip()
     if response_text.startswith("```json"):
         response_text = response_text[7:]
@@ -125,7 +145,7 @@ Example:
     try:
         raw_reqs = json.loads(response_text)
     except json.JSONDecodeError as e:
-        raise ValueError(f"Failed to parse Gemini output as JSON: {e}\nRaw Response:\n{response_text}")
+        raise ValueError(f"Failed to parse LLM output as JSON: {e}\nRaw Response:\n{response_text}")
 
     # 5. Convert JSON into Pydantic models required for the shared contract
     requirements = []

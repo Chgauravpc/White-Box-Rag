@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 _tmp = tempfile.mkdtemp()
 os.environ["CHROMA_PATH"]    = os.path.join(_tmp, "chromadb")
 os.environ["SQLITE_PATH"]    = os.path.join(_tmp, "metadata.db")
-os.environ["GEMINI_API_KEY"] = "test-key-not-used"
+os.environ["GROQ_API_KEY"] = "test-key-not-used"
 
 
 # ── Fake ML models ────────────────────────────────────────────────────────────

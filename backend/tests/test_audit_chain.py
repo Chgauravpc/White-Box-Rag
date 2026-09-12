@@ -1,7 +1,7 @@
 """
 Unit tests for the tamper-evident audit hash-chain (Feature 1).
 
-Pure math over synthetic rows — no DB, no models, no Gemini. Mirrors exactly
+Pure math over synthetic rows — no DB, no models, no LLM. Mirrors exactly
 what shared/database.py::finalize_audit_record persists and what the
 /audit/verify-integrity endpoint checks.
 """

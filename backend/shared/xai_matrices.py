@@ -1,55 +1,66 @@
 """xai_matrices.py - Pure Mathematical XAI Matrix Computations. LLM extracts, Math judges."""
 
-import re
 import logging
 import numpy as np
 import spacy
 from sentence_transformers import SentenceTransformer, CrossEncoder
 
+from shared import config
+from shared.config import PREMISE_NORMALIZER
+from shared.text_normalize import normalize_premise
+from shared.chunk_key import resolve_chunk_key
+
 logger = logging.getLogger(__name__)
 
 def _load_models():
-    logger.info("Loading SentenceTransformer (BAAI/bge-large-en-v1.5)...")
-    encoder = SentenceTransformer("BAAI/bge-large-en-v1.5")
-    logger.info("Loading NLI CrossEncoder (cross-encoder/nli-deberta-v3-base)...")
-    nli = CrossEncoder("cross-encoder/nli-deberta-v3-base", num_labels=3)
+    logger.info(f"Loading SentenceTransformer ({config.XAI_EMBEDDING_MODEL}, revision={config.XAI_EMBEDDING_MODEL_REVISION or 'default'})...")
+    encoder = SentenceTransformer(config.XAI_EMBEDDING_MODEL, revision=config.XAI_EMBEDDING_MODEL_REVISION)
+    logger.info(f"Loading NLI CrossEncoder ({config.NLI_MODEL}, revision={config.NLI_MODEL_REVISION or 'default'})...")
+    nli = CrossEncoder(config.NLI_MODEL, revision=config.NLI_MODEL_REVISION, num_labels=3)
     logger.info("XAI matrix models ready.")
     return encoder, nli
 
 _encoder, _nli = _load_models()
-_spacy_nlp = spacy.load("en_core_web_sm")
+_spacy_nlp = spacy.load(config.SPACY_MODEL)
 
 def get_encoder(): return _encoder
 def get_nli():     return _nli
 
-MIN_SENTENCE_LEN  = 20
-NLI_TOP_K         = 3
-NLI_PREPROCESS_AT = 60
 
-_RE_NUMERIC_ROW    = re.compile(r"^[\d\s\(\),\.\-]+$")
-_RE_PAGE_MARKER    = re.compile(r"^\d+\s*\|\s*P\s*a\s*g\s*e$", re.IGNORECASE)
-_RE_TABLE_HEADER   = re.compile(r"^(Month\s*End|FCA|Gold|SDR|RTP|Forex\s*Reserves|USD\s*Million|Rs\.?\s*Crore|Table\s*\d+|Chart\s*\d+).*$", re.IGNORECASE)
-_RE_ALL_CAPS_SHORT = re.compile(r"^[A-Z\s\-\.]{1,30}$")
-_RE_DATE_NUM_ROW  = re.compile(r"^[A-Za-z]+-\d{2,4}\s+[\d\s\(\),\.\-]+$")
+def model_identity() -> dict:
+    """Resolved model identity for run provenance — which encoder/NLI/spaCy
+    model (and pinned revision, if any) actually produced a given run's
+    numbers. See shared/runconfig.py."""
+    return {
+        "xai_embedding_model": config.XAI_EMBEDDING_MODEL,
+        "xai_embedding_model_revision": config.XAI_EMBEDDING_MODEL_REVISION,
+        "xai_embedding_dim": int(_encoder.get_sentence_embedding_dimension()),
+        "nli_model": config.NLI_MODEL,
+        "nli_model_revision": config.NLI_MODEL_REVISION,
+        "spacy_model": config.SPACY_MODEL,
+        "chroma_embedding_model": config.CHROMA_EMBEDDING_MODEL,
+    }
 
-def strip_table_noise(text):
-    """Remove numeric table rows, page markers, and column headers from PDF-extracted text."""
-    lines = text.split("\n")
-    clean = []
-    for line in lines:
-        s = line.strip()
-        if not s:                               continue
-        if _RE_NUMERIC_ROW.match(s):            continue
-        if _RE_PAGE_MARKER.match(s):            continue
-        if _RE_TABLE_HEADER.match(s):           continue
-        if _RE_ALL_CAPS_SHORT.match(s) and len(s) < 25: continue
-        if _RE_DATE_NUM_ROW.match(s):               continue   # e.g. "September-24  617075..."
-        clean.append(s)
-    return " ".join(clean)
 
-def extract_relevant_sentences(claim, passage):
-    """Extract top-K prose sentences most similar to the claim. Strips table noise first."""
-    clean_passage = strip_table_noise(passage)
+# Re-exported from config (not re-declared as literals) so the many external
+# imports of these names (e.g. verification/stability.py imports
+# NLI_PREPROCESS_AT from here) keep working unchanged.
+MIN_SENTENCE_LEN      = config.MIN_SENTENCE_LEN
+NLI_TOP_K              = config.NLI_TOP_K
+NLI_PREPROCESS_AT      = config.NLI_PREPROCESS_AT
+MIN_ATTRIBUTION_SCORE  = config.MIN_ATTRIBUTION_SCORE
+AMBIGUITY_GAP_THRESHOLD = config.AMBIGUITY_GAP_THRESHOLD
+WEAK_ATTRIBUTION_SCORE  = config.WEAK_ATTRIBUTION_SCORE
+
+def extract_relevant_sentences(claim, passage, profile=None):
+    """Extract top-K prose sentences most similar to the claim.
+
+    Normalizes the passage per `profile` first (default: config.PREMISE_NORMALIZER).
+    Idempotent on an already-normalized passage, so callers that pre-normalize
+    (verify_claims_batch) and callers that don't (build_entailment_matrix) both
+    get consistent behavior.
+    """
+    clean_passage, _ = normalize_premise(passage, profile or PREMISE_NORMALIZER)
     doc = _spacy_nlp(clean_passage)
     sentences = [s.text.strip() for s in doc.sents if len(s.text.strip()) > MIN_SENTENCE_LEN]
     if not sentences:
@@ -76,7 +87,13 @@ def build_retrieval_similarity_matrix(query, chunks):
     S = (q_norm @ k_norm.T).squeeze(axis=0)
     if np.ndim(S) == 0:
         S = np.array([float(S)])
-    return [c["section_id"] for c in chunks], [float(x) for x in S]
+    # Canonical chunk keys, NOT bare section_id — two documents may share a
+    # section_id (both have a "1.1"), which would otherwise collide here.
+    chunk_ids = [
+        resolve_chunk_key(c["publication_name"], c["edition_date"], c["section_id"], c["chunk_text"], c.get("chunk_key", ""))
+        for c in chunks
+    ]
+    return chunk_ids, [float(x) for x in S]
 
 def build_entailment_matrix(claims, passages):
     if not claims or not passages:
@@ -88,24 +105,29 @@ def build_entailment_matrix(claims, passages):
     raw_scores = _nli.predict(pairs, apply_softmax=True)
     return raw_scores.reshape(len(claims), len(passages), 3), ["contradiction", "entailment", "neutral"]
 
-def verify_claims_batch(claims_with_passages):
+def verify_claims_batch(claims_with_passages, profile=None):
     if not claims_with_passages:
         return []
-    focused_pairs    = []
-    focused_passages = []
+    profile = profile or PREMISE_NORMALIZER
+    focused_pairs     = []
+    focused_passages  = []
+    premise_deletions = []
     for claim, raw_passage in claims_with_passages:
-        # Always strip table noise first — even short passages may contain table rows
-        stripped = strip_table_noise(raw_passage) if raw_passage else ""
+        # Always normalize first — even short passages may contain PDF artifacts
+        # (or, under "financial_reports", table rows). Deletions are recorded per
+        # claim so premise mutation is auditable rather than invisible.
+        stripped, deleted = normalize_premise(raw_passage, profile) if raw_passage else ("", [])
         if stripped and len(stripped.split()) > NLI_PREPROCESS_AT:
-            focused = extract_relevant_sentences(claim, stripped)
+            focused = extract_relevant_sentences(claim, stripped, profile=profile)
         else:
             focused = stripped  # already clean; no sentence selection needed
         focused_pairs.append((focused, claim))
         focused_passages.append(focused)
+        premise_deletions.append(deleted)
     scores = _nli.predict(focused_pairs, apply_softmax=True)
     labels = ["contradiction", "entailment", "neutral"]
     results = []
-    for (claim, _), score_triplet, focused in zip(claims_with_passages, scores, focused_passages):
+    for (claim, _), score_triplet, focused, deleted in zip(claims_with_passages, scores, focused_passages, premise_deletions):
         top_idx = int(score_triplet.argmax())
         results.append({
             "claim_text":          claim,
@@ -114,10 +136,9 @@ def verify_claims_batch(claims_with_passages):
             "contradiction_score": float(score_triplet[0]),
             "neutral_score":       float(score_triplet[2]),
             "focused_passage":     focused,
+            "premise_deletions":   deleted,
         })
     return results
-
-MIN_ATTRIBUTION_SCORE = 0.45
 
 def build_attribution_matrix(answer_sentences, chunks):
     if not answer_sentences or not chunks:
@@ -198,21 +219,27 @@ def detect_conflicts(old_chunks, new_chunks, threshold=0.7):
         })
     return conflicts
 
-AMBIGUITY_GAP_THRESHOLD = 0.02   # recalibrated from 0.05
-WEAK_ATTRIBUTION_SCORE  = 0.65
-
 def compute_shapley_contributions(verifications, primary_attributions=None):
     """Compute Shapley penalty vector across NLI verdicts AND attribution quality.
 
     primary_attributions[i] corresponds to verifications[i].
     Including attribution penalties ensures shapley.overall_score matches
-    trust_gate.overall_score (both deduct the same set of penalties).
+    trust_gate.overall_score (both deduct the same set of penalties — both
+    read the SAME config.PENALTY_* constants, so they can't drift apart).
     """
     if primary_attributions is None:
         primary_attributions = []
 
-    nli_penalties  = {"contradiction": 0.30, "neutral": 0.10, "low_confidence": 0.20, "mid_confidence": 0.05}
-    attr_penalties = {"ambiguous": 0.05, "weak": 0.03}
+    nli_penalties  = {
+        "contradiction": config.PENALTY_CONTRADICTION,
+        "neutral": config.PENALTY_NEUTRAL,
+        "low_confidence": config.PENALTY_LOW_CONFIDENCE,
+        "mid_confidence": config.PENALTY_MID_CONFIDENCE,
+    }
+    attr_penalties = {
+        "ambiguous": config.PENALTY_AMBIGUOUS_ATTRIBUTION,
+        "weak": config.PENALTY_WEAK_ATTRIBUTION,
+    }
 
     contributions = []
     for i, v in enumerate(verifications):
@@ -227,9 +254,9 @@ def compute_shapley_contributions(verifications, primary_attributions=None):
         if verdict == "NEUTRAL":
             phi += nli_penalties["neutral"]; reasons.append("neutral")
         if verdict != "CONTRADICTION":
-            if entail_score < 0.5:
+            if entail_score < config.LOW_CONFIDENCE_CEIL:
                 phi += nli_penalties["low_confidence"]; reasons.append("low NLI confidence ({:.2f})".format(entail_score))
-            elif entail_score <= 0.8:
+            elif entail_score <= config.MID_CONFIDENCE_CEIL:
                 phi += nli_penalties["mid_confidence"]; reasons.append("mid NLI confidence ({:.2f})".format(entail_score))
 
         # Attribution penalties (mirrors trust gate logic exactly)

@@ -1,8 +1,9 @@
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List
 
+from shared import config
 from shared.models import Claim, EditionConflict
 from shared.xai_matrices import build_conflict_matrix, get_encoder
 from shared.xai_engine import cosine_similarity
@@ -17,9 +18,9 @@ logger = logging.getLogger(__name__)
 _UNSTRUCTURED_SECTION_RE = re.compile(r"^UNSTRUCTURED-p\d+$")
 
 # Cheap cosine pre-filter before paying for an NLI call — near-identical text
-# can't meaningfully contradict.
-CONFLICT_PREFILTER_COSINE = 0.90
-MAX_CONFLICT_CHECKS_PER_QUERY = 5
+# can't meaningfully contradict. Re-exported from config, not a literal.
+CONFLICT_PREFILTER_COSINE = config.CONFLICT_PREFILTER_COSINE
+MAX_CONFLICT_CHECKS_PER_QUERY = config.MAX_CONFLICT_CHECKS_PER_QUERY
 
 
 async def detect_conflicts(publication: str, topic: str, older_date: str, older_text: str, newer_date: str, newer_text: str, section_id: str) -> EditionConflict:
@@ -35,7 +36,7 @@ async def detect_conflicts(publication: str, topic: str, older_date: str, older_
         )
         
     contradiction_prob = float(C_matrix[0][0])
-    has_conflict = contradiction_prob > 0.70
+    has_conflict = contradiction_prob > config.CONFLICT_CONTRADICTION_THRESHOLD
     
     return EditionConflict(
         publication=publication,
@@ -73,7 +74,7 @@ def _cache_store(publication: str, section_id: str, edition_a: str, edition_b: s
             "(publication, section_id, edition_a, edition_b, cosine_sim, has_conflict, authoritative, cached_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (publication, section_id, edition_a, edition_b, cosine_sim, int(has_conflict),
-             authoritative, datetime.utcnow().isoformat()),
+             authoritative, datetime.now(timezone.utc).isoformat()),
         )
         conn.commit()
         conn.close()

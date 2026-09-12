@@ -17,7 +17,7 @@ import requests
 BASE_URL = os.environ.get("BACKEND_API_URL", "http://localhost:8000/api")
 
 SHORT_TIMEOUT = 15
-LONG_TIMEOUT = 180  # /query and /brd/validate run a multi-model pipeline (several Gemini calls)
+LONG_TIMEOUT = 180  # /query and /brd/validate run a multi-model pipeline (several LLM calls)
 
 
 class ApiError(Exception):
@@ -185,8 +185,8 @@ def get_eval_run(run_id: int) -> dict:
     return _request("GET", f"/eval/runs/{run_id}")
 
 
-def calibrate_conformal(alpha: float = 0.1, dataset_path: Optional[str] = None, run_label: str = "") -> dict:
-    payload = {"alpha": alpha, "dataset_path": dataset_path, "run_label": run_label}
+def calibrate_conformal(alpha: float = 0.1, dataset_path: Optional[str] = None, run_label: str = "", force: bool = False) -> dict:
+    payload = {"alpha": alpha, "dataset_path": dataset_path, "run_label": run_label, "force": force}
     return _request("POST", "/eval/calibrate", timeout=LONG_TIMEOUT, json=payload)
 
 

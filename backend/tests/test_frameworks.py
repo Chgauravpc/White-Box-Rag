@@ -1,7 +1,7 @@
 """
 Tests for the regulatory framework catalog (Feature 5).
 
-Static data + coverage math — no I/O, no models, no Gemini.
+Static data + coverage math — no I/O, no models, no LLM.
 """
 
 from compliance.frameworks import get_frameworks, _STATUS_WEIGHT

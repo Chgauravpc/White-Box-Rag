@@ -9,6 +9,7 @@ evaluation harness (backend/eval/harness.py).
 import asyncio
 import logging
 import time
+from typing import Optional
 
 import numpy as np
 
@@ -45,6 +46,8 @@ from shared.xai_matrices import (
 )
 from shared.database import store_query_embedding, get_past_query_embeddings, finalize_audit_record
 from shared.models import NLIVerdict
+from shared.chunk_key import resolve_chunk_key
+from shared.llm import llm_call_scope, get_current_llm_calls
 
 logger = logging.getLogger(__name__)
 
@@ -64,18 +67,52 @@ def _faithfulness(verifications: list) -> float:
 
 
 def _deduplicate_chunks(chunks: list[dict]) -> list[dict]:
-    """Deduplicate retrieved chunks: keep one (highest-index = highest RRF) per section_id.
-    Filters out UNSTRUCTURED-p* chunks from similarity matrices to keep provenance clean.
+    """Deduplicate retrieved chunks: keep one (highest-index = highest RRF) per
+    chunk identity.
+
+    Keys on the canonical chunk_key (falling back to a content-addressed key
+    for legacy pre-migration data), NOT bare section_id — two documents that
+    happen to share a section_id (e.g. both have a "1.1") must not collide
+    and silently drop one another's chunk out of context.
     """
     seen: dict[str, dict] = {}
+    dropped = 0
     for chunk in chunks:
-        sid = chunk["section_id"]
-        if sid not in seen:
-            seen[sid] = chunk  # first occurrence = highest RRF rank
+        key = resolve_chunk_key(
+            chunk["publication_name"], chunk["edition_date"], chunk["section_id"],
+            chunk["chunk_text"], chunk.get("chunk_key", ""),
+        )
+        if key not in seen:
+            seen[key] = chunk  # first occurrence = highest RRF rank
+        else:
+            dropped += 1
+    if dropped:
+        logger.debug(f"_deduplicate_chunks: collapsed {dropped} true duplicate chunk(s)")
     return list(seen.values())
 
 
-async def run_query_pipeline(query: str, filters: dict | None = None) -> AuditReport:
+async def run_query_pipeline(
+    query: str,
+    filters: dict | None = None,
+    eval_mode: bool = False,
+    abstention_threshold: Optional[float] = None,
+) -> AuditReport:
+    """Thin wrapper: opens a Phase-2 llm_call_scope() around the whole query
+    so every call_llm() made anywhere in the pipeline (rag.py, mapper.py,
+    audit.py, stability.py) is collected into the returned report's
+    llm_calls, then delegates to _run_query_pipeline for the actual work."""
+    with llm_call_scope():
+        report = await _run_query_pipeline(query, filters, eval_mode, abstention_threshold)
+        report.llm_calls = get_current_llm_calls()
+        return report
+
+
+async def _run_query_pipeline(
+    query: str,
+    filters: dict | None = None,
+    eval_mode: bool = False,
+    abstention_threshold: Optional[float] = None,
+) -> AuditReport:
     """Ask a question and get a fully integrated RAG + Verification + Compliance Audit response.
 
     The output includes all XAI mathematical artifacts:
@@ -83,21 +120,37 @@ async def run_query_pipeline(query: str, filters: dict | None = None) -> AuditRe
     - shapley: Shapley-style penalty decomposition
     - faithfulness: |ENTAILMENT| / total claims
     - related_queries: past queries with cosine_sim > 0.70
+
+    Args:
+        eval_mode: Skips Step 5 (requirement mapping) and Step 6 (LLM
+            audit-report generation) — governance bookkeeping that no
+            benchmark metric reads (see eval/harness.py::_run_one), and that
+            would otherwise burn 2 of the 4 LLM calls per query and write a
+            row into the production audit trail for every benchmark item.
+            The live `/query` HTTP route never sets this — default is False,
+            live-query behavior is unchanged.
+        abstention_threshold: When set, passed straight to
+            `should_abstain(..., threshold=...)` instead of letting it read
+            `verification/conformal.py::load_active_threshold()` itself. Lets
+            an eval run freeze the threshold once at run start so a
+            concurrent recalibration can't change results mid-run (finding #20).
     """
     latency_ms: dict[str, float] = {}
-    gemini_call_count = 0
+    llm_call_count = 0
 
     # ── Step 1: Hybrid Retrieval & Retrieval Matrix (S) ──
     logger.info(f"Step 1: Retrieving chunks for: '{query[:80]}'")
     _t0 = time.monotonic()
     raw_chunks = hybrid_retrieve(query=query, filters=filters)
 
-    # Convert to dicts, deduplicate by section_id
+    # Convert to dicts, deduplicate by chunk identity (not bare section_id —
+    # see _deduplicate_chunks)
     dict_chunks = [{
         "chunk_text":       c.chunk_text,
         "section_id":       c.section_id,
         "publication_name": c.publication_name,
         "edition_date":     c.edition_date,
+        "chunk_key":        c.chunk_key,
     } for c in raw_chunks]
     dict_chunks = _deduplicate_chunks(dict_chunks)
 
@@ -108,19 +161,21 @@ async def run_query_pipeline(query: str, filters: dict | None = None) -> AuditRe
     # ── Step 2: Generation & Attribution Matrix (A) ──
     _t0 = time.monotonic()
     rag_response, A_matrix = await rag_query(query, dict_chunks)
-    gemini_call_count += 1
+    llm_call_count += 1
     latency_ms["generation_ms"] = round((time.monotonic() - _t0) * 1000, 2)
 
     # ── Step 3: NLI Verification, Entailment Matrix (E), focused passages ──
     logger.info("Step 3: Batched NLI verification via CrossEncoder")
     _t0 = time.monotonic()
-    verifications, E_matrix, focused_passages = await verify_all_claims(rag_response.claims)
+    verifications, E_matrix, focused_passages, premise_deletions = await verify_all_claims(rag_response.claims)
     latency_ms["verification_ms"] = round((time.monotonic() - _t0) * 1000, 2)
 
-    # Stamp focused_passage onto each Claim for full audit traceability
+    # Stamp focused_passage/premise_deletions onto each Claim for full audit traceability
     for i, claim in enumerate(rag_response.claims):
         if i < len(focused_passages):
             claim.focused_passage = focused_passages[i]
+        if i < len(premise_deletions):
+            claim.premise_deletions = premise_deletions[i]
 
     # ── Step 4: XAI Math — Shapley (φ), primary attributions, assemble artifacts ──
     logger.info("Step 4: Computing Shapley and attribution artifacts")
@@ -160,10 +215,13 @@ async def run_query_pipeline(query: str, filters: dict | None = None) -> AuditRe
         scores=A_scores,
         primary_attributions=prim_attrs,
     )
+    # Keyed by publication|edition|section, not bare section_id — two documents
+    # citing their own "1.1" must not overwrite each other's passage here.
     seen_passages = {}
     for c in rag_response.claims:
-        if c.source_passage and c.source_section_id not in seen_passages:
-            seen_passages[c.source_section_id] = c.source_passage
+        passage_key = f"{c.source_publication}|{c.source_edition}|{c.source_section_id}"
+        if c.source_passage and passage_key not in seen_passages:
+            seen_passages[passage_key] = c.source_passage
     entail_mat = EntailmentMatrix(
         claim_texts=[c.text for c in rag_response.claims],
         passage_ids=list(seen_passages.keys()),
@@ -194,7 +252,8 @@ async def run_query_pipeline(query: str, filters: dict | None = None) -> AuditRe
             claim.filter_reason = filter_reasons[i]
 
     abstained, raw_abstain_reason, retained_trust_score = should_abstain(
-        rag_response.claims, verifications, prim_attrs, retained_flags, conflicts
+        rag_response.claims, verifications, prim_attrs, retained_flags, conflicts,
+        threshold=abstention_threshold,
     )
     abstention_reason = ABSTENTION_MESSAGE_TEMPLATE.format(reason=raw_abstain_reason) if abstained else ""
 
@@ -210,7 +269,7 @@ async def run_query_pipeline(query: str, filters: dict | None = None) -> AuditRe
     )
     latency_ms["stability_check_ms"] = round((time.monotonic() - _t0) * 1000, 2)
     if not stability_note.startswith("Skipped"):
-        gemini_call_count += 1
+        llm_call_count += 1
     answer_relevancy = compute_answer_relevancy(query, rag_response.answer)
     context_utilization = compute_context_utilization(prim_attrs, chunk_ids)
     context_diversity = compute_context_diversity(dict_chunks)
@@ -228,34 +287,43 @@ async def run_query_pipeline(query: str, filters: dict | None = None) -> AuditRe
         context_diversity=context_diversity,
     )
 
-    # ── Step 5: Requirement/Compliance Mapping (BP3) ──
-    logger.info("Step 5: Mapping the query itself as a requirement-alignment gap check")
-    _t0 = time.monotonic()
-    brd_req = BRDRequirement(id="ASK", text=query)
-    mapped_dict = await map_requirement(brd_req)
-    gemini_call_count += 1
-    brd_req.mapped_sections = [c.chunk_text for c in mapped_dict.get("relevant_chunks", [])]
-    brd_req.alignment_score = mapped_dict.get("alignment_score", 0.0)
-    brd_req.gaps = mapped_dict.get("gaps", [])
-    brd_req.risk_flags = mapped_dict.get("violations", [])
-    brd_req.risk_level = mapped_dict.get("risk_level", "LOW")
-    brd_req.remediation = mapped_dict.get("remediation_suggestions", "")
-    latency_ms["compliance_mapping_ms"] = round((time.monotonic() - _t0) * 1000, 2)
+    # ── Step 5 & 6: Requirement/Compliance Mapping + Audit Report (BP3) ──
+    # Skipped in eval_mode — see run_query_pipeline's docstring. Neither
+    # step's output feeds anything eval/harness.py::_run_one reads, and
+    # skipping them halves LLM calls/query for a benchmark run and keeps
+    # eval queries out of the production audit trail entirely (log_id stays
+    # None below, so Step 7/8 — embedding storage, chain finalization — are
+    # skipped too, exactly as if this were a normal "nothing to persist" path).
+    if eval_mode:
+        logger.info("Step 5/6: eval_mode — skipping requirement mapping and audit-report generation")
+        audit_report_dict: dict = {"query": query}
+    else:
+        logger.info("Step 5: Mapping the query itself as a requirement-alignment gap check")
+        _t0 = time.monotonic()
+        brd_req = BRDRequirement(id="ASK", text=query)
+        mapped_dict = await map_requirement(brd_req)
+        llm_call_count += 1
+        brd_req.mapped_sections = [c.chunk_text for c in mapped_dict.get("relevant_chunks", [])]
+        brd_req.alignment_score = mapped_dict.get("alignment_score", 0.0)
+        brd_req.gaps = mapped_dict.get("gaps", [])
+        brd_req.risk_flags = mapped_dict.get("violations", [])
+        brd_req.risk_level = mapped_dict.get("risk_level", "LOW")
+        brd_req.remediation = mapped_dict.get("remediation_suggestions", "")
+        latency_ms["compliance_mapping_ms"] = round((time.monotonic() - _t0) * 1000, 2)
 
-    # ── Step 6: Generate Audit Report ──
-    logger.info("Step 6: Compiling Audit Report")
-    _t0 = time.monotonic()
-    audit_report_dict = await generate_audit_report(
-        query=query,
-        rag_response=rag_response.answer,
-        claims=rag_response.claims,
-        verifications=verifications,
-        trust_gate=trust_gate,
-        edition_conflicts=conflicts,
-        brd_results=[brd_req],
-    )
-    gemini_call_count += 1
-    latency_ms["audit_report_ms"] = round((time.monotonic() - _t0) * 1000, 2)
+        logger.info("Step 6: Compiling Audit Report")
+        _t0 = time.monotonic()
+        audit_report_dict = await generate_audit_report(
+            query=query,
+            rag_response=rag_response.answer,
+            claims=rag_response.claims,
+            verifications=verifications,
+            trust_gate=trust_gate,
+            edition_conflicts=conflicts,
+            brd_results=[brd_req],
+        )
+        llm_call_count += 1
+        latency_ms["audit_report_ms"] = round((time.monotonic() - _t0) * 1000, 2)
 
     # ── Step 7: Store embedding + find related queries (pure cosine, no LLM) ──
     log_id = audit_report_dict.get("id")
@@ -284,7 +352,7 @@ async def run_query_pipeline(query: str, filters: dict | None = None) -> AuditRe
     audit_report_dict["scorecard"] = scorecard.model_dump()
     audit_report_dict["counterfactuals"] = counterfactuals
     audit_report_dict["latency_ms"] = latency_ms
-    audit_report_dict["gemini_call_count"] = gemini_call_count
+    audit_report_dict["llm_call_count"] = llm_call_count
 
     # ── Step 8: Tamper-evident finalization ──
     # Overwrite the partial row written by generate_audit_report with the COMPLETE
