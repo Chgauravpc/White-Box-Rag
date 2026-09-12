@@ -24,6 +24,61 @@ def _load_models():
 _encoder, _nli = _load_models()
 _spacy_nlp = spacy.load(config.SPACY_MODEL)
 
+# ── NLI label order ─────────────────────────────────────────
+# The 3-way output order is a property of the CHECKPOINT, not of NLI. This
+# code used to hardcode cross-encoder/nli-deberta-v3-base's order
+# (contradiction, entailment, neutral) in three places — but NLI_MODEL is
+# env-overridable, and roberta-large-mnli (the most natural swap) emits
+# (contradiction, neutral, entailment). Swapping the model would therefore
+# have silently exchanged "entailment" and "neutral" for every claim in the
+# system: hallucinations scored as grounded, with nothing raising.
+# The order is now read from the checkpoint's own id2label.
+DEFAULT_NLI_LABELS = ["contradiction", "entailment", "neutral"]
+
+
+def _resolve_nli_label_order(nli) -> list[str]:
+    """The checkpoint's label order, falling back to the documented default.
+
+    Falls back silently when the config isn't a real mapping (the test suite
+    mocks CrossEncoder), and loudly when it IS a mapping but doesn't describe
+    a 3-way NLI head — that means the configured model cannot be used here.
+    """
+    try:
+        id2label = nli.model.config.id2label
+        if not isinstance(id2label, dict):
+            return list(DEFAULT_NLI_LABELS)
+        labels = [str(id2label[i]).strip().lower() for i in range(3)]
+    except Exception:
+        return list(DEFAULT_NLI_LABELS)
+
+    if sorted(labels) != sorted(DEFAULT_NLI_LABELS):
+        logger.error(
+            "NLI model %s reports labels %s, which are not the expected "
+            "three-way (contradiction/entailment/neutral) set. Falling back to %s — "
+            "verdicts from this model are NOT trustworthy.",
+            config.NLI_MODEL, labels, DEFAULT_NLI_LABELS,
+        )
+        return list(DEFAULT_NLI_LABELS)
+
+    if labels != DEFAULT_NLI_LABELS:
+        logger.warning(
+            "NLI model %s uses label order %s (not the default %s). Index mapping "
+            "adjusted accordingly.", config.NLI_MODEL, labels, DEFAULT_NLI_LABELS,
+        )
+    return labels
+
+
+NLI_LABELS = _resolve_nli_label_order(_nli)
+CONTRADICTION_IDX = NLI_LABELS.index("contradiction")
+ENTAILMENT_IDX = NLI_LABELS.index("entailment")
+NEUTRAL_IDX = NLI_LABELS.index("neutral")
+
+
+def entailment_score_of(score_triplet) -> float:
+    """Pull the entailment probability out of one 3-way output, whatever order
+    the active checkpoint emits."""
+    return float(score_triplet[ENTAILMENT_IDX])
+
 def get_encoder(): return _encoder
 def get_nli():     return _nli
 
@@ -98,13 +153,13 @@ def build_retrieval_similarity_matrix(query, chunks):
 
 def build_entailment_matrix(claims, passages):
     if not claims or not passages:
-        return np.array([]), ["contradiction", "entailment", "neutral"]
+        return np.array([]), list(NLI_LABELS)
     pairs = [
         (extract_relevant_sentences(claim, passage) if len(passage.split()) > NLI_PREPROCESS_AT else passage, claim)
         for claim in claims for passage in passages
     ]
     raw_scores = _nli.predict(pairs, apply_softmax=True)
-    return raw_scores.reshape(len(claims), len(passages), 3), ["contradiction", "entailment", "neutral"]
+    return raw_scores.reshape(len(claims), len(passages), 3), list(NLI_LABELS)
 
 def verify_claims_batch(claims_with_passages, profile=None):
     if not claims_with_passages:
@@ -159,16 +214,17 @@ def verify_claims_batch(claims_with_passages, profile=None):
     scores = _nli.predict(focused_pairs, apply_softmax=True) if focused_pairs else []
     score_iter = iter(scores)
 
-    labels = ["contradiction", "entailment", "neutral"]
     results = []
     for (claim, _), focused, deleted, status in zip(
         claims_with_passages, focused_passages, premise_deletions, evidence_statuses
     ):
         if status == "ok":
             score_triplet = next(score_iter)
-            verdict = labels[int(score_triplet.argmax())].upper()
+            verdict = NLI_LABELS[int(score_triplet.argmax())].upper()
             entail, contra, neutral = (
-                float(score_triplet[1]), float(score_triplet[0]), float(score_triplet[2]),
+                float(score_triplet[ENTAILMENT_IDX]),
+                float(score_triplet[CONTRADICTION_IDX]),
+                float(score_triplet[NEUTRAL_IDX]),
             )
         else:
             # NOT_ENOUGH_INFO is the honest verdict for "no evidence was

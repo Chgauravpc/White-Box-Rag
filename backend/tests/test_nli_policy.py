@@ -195,3 +195,60 @@ class TestStripReasonHonesty:
         )]
         _, retained, reasons = filter_claims(claims, verifications, [{}])
         assert retained == [False] and reasons == ["low_confidence"]
+
+
+class TestNliLabelOrder:
+    """The 3-way output order is a property of the CHECKPOINT, not of NLI.
+
+    NLI_MODEL is env-overridable and roberta-large-mnli — the most natural
+    swap — emits (contradiction, neutral, entailment). Hardcoding
+    deberta's order meant a model swap would silently exchange "entailment"
+    and "neutral" for every claim: hallucinations scored as grounded, nothing
+    raising.
+    """
+
+    def test_default_order_matches_the_documented_checkpoint(self):
+        import shared.xai_matrices as xm
+        assert xm.NLI_LABELS == ["contradiction", "entailment", "neutral"]
+        assert (xm.CONTRADICTION_IDX, xm.ENTAILMENT_IDX, xm.NEUTRAL_IDX) == (0, 1, 2)
+
+    def test_order_is_read_from_the_checkpoint_config(self):
+        """A roberta-style head must remap the indices, not be assumed away."""
+        import shared.xai_matrices as xm
+
+        class _Cfg:
+            id2label = {0: "CONTRADICTION", 1: "NEUTRAL", 2: "ENTAILMENT"}
+
+        class _Model:
+            config = _Cfg()
+
+        class _Nli:
+            model = _Model()
+
+        assert xm._resolve_nli_label_order(_Nli()) == ["contradiction", "neutral", "entailment"]
+
+    def test_non_nli_head_falls_back_and_does_not_crash(self):
+        import shared.xai_matrices as xm
+
+        class _Cfg:
+            id2label = {0: "POSITIVE", 1: "NEGATIVE", 2: "NEUTRAL"}
+
+        class _Model:
+            config = _Cfg()
+
+        class _Nli:
+            model = _Model()
+
+        assert xm._resolve_nli_label_order(_Nli()) == xm.DEFAULT_NLI_LABELS
+
+    def test_mocked_model_falls_back_silently(self):
+        """conftest mocks CrossEncoder; that must not be treated as a real
+        label mapping."""
+        import shared.xai_matrices as xm
+        from unittest.mock import MagicMock
+        assert xm._resolve_nli_label_order(MagicMock()) == xm.DEFAULT_NLI_LABELS
+
+    def test_entailment_score_of_respects_resolved_order(self, monkeypatch):
+        import shared.xai_matrices as xm
+        monkeypatch.setattr(xm, "ENTAILMENT_IDX", 2)
+        assert xm.entailment_score_of([0.1, 0.2, 0.7]) == 0.7

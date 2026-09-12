@@ -20,7 +20,7 @@ from typing import List
 
 from shared import config
 from shared.models import Claim, TrustStatus
-from shared.xai_matrices import get_nli, extract_relevant_sentences, NLI_PREPROCESS_AT
+from shared.xai_matrices import get_nli, extract_relevant_sentences, entailment_score_of, NLI_PREPROCESS_AT
 
 logger = logging.getLogger(__name__)
 
@@ -62,8 +62,11 @@ async def compute_paraphrase_stability(
             passage = extract_relevant_sentences(c.text, passage)
         pairs.append((passage, c.text))
 
-    scores = nli.predict(pairs, apply_softmax=True)  # [contradiction, entailment, neutral] per pair
-    entailment_scores = [float(s[1]) for s in scores]
+    # Index order comes from the active checkpoint, not a hardcoded assumption
+    # (shared/xai_matrices.py::NLI_LABELS) — a different NLI_MODEL can emit a
+    # different order, which would silently read "neutral" as "entailment".
+    scores = nli.predict(pairs, apply_softmax=True)
+    entailment_scores = [entailment_score_of(s) for s in scores]
     stability = round(sum(entailment_scores) / len(entailment_scores), 6)
 
     return stability, f"Compared {len(retained_claims)} retained claim(s) against a resampled answer via NLI entailment"
