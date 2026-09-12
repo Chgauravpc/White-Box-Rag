@@ -127,6 +127,7 @@ White Box RAG/
 │   │   ├── harness.py             # run_eval / run_calibration (end-to-end plane)
 │   │   ├── detector.py            # detector plane: claim+premise+label → P/R/F1/AUROC, no retrieval/LLM
 │   │   ├── retrieval.py           # retrieval plane: graded chunk labels → nDCG/recall@k, zero LLM calls
+│   │   ├── adapters.py            # HaluEval / FEVER / generic → detector items
 │   │   ├── scoring.py             # label-vs-prediction accuracy: P/R/F1/nDCG/AUROC + CIs
 │   │   └── schema.py              # dataset v2 shape + validator + v1 compatibility loader
 │   ├── scripts/                   # manual, live-credential operator tools (never pytest-collected)
@@ -219,7 +220,7 @@ cd backend
 pytest
 ```
 
-340 tests, entirely against mocked ML models (`backend/conftest.py`) and a fake `AsyncOpenAI` client (`backend/tests/test_llm_pool.py`) — no API key or model download needed. Runs automatically on every push/PR via `.github/workflows/tests.yml`.
+364 tests, entirely against mocked ML models (`backend/conftest.py`) and a fake `AsyncOpenAI` client (`backend/tests/test_llm_pool.py`) — no API key or model download needed. Runs automatically on every push/PR via `.github/workflows/tests.yml`.
 
 ---
 

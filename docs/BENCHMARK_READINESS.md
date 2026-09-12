@@ -29,7 +29,7 @@ why a change happened.
 | **2** ✅ | Multi-provider (Groq **+** OpenRouter) API key pool |
 | **3** 🟡 | Dataset scale-up — hundreds of labeled items, graded retrieval ground truth (W3.1 corpus identity ✅; labeling not started) |
 | **4** 🟡 | Evaluation planes (retrieval / detector / end-to-end) + NLI multi-premise + domain-neutral normalization (W4.3 done, empty-premise guard done; planes + multi-premise open) |
-| **5** | External benchmark adapters (RAGTruth, HaluEval, FEVER, BEIR) |
+| **5** 🟡 | External benchmark adapters (HaluEval/FEVER/generic converters done; RAGTruth + BEIR open; needs real data) |
 | **6** | Ablation & baseline comparison (plain-RAG vs. full governance) |
 | **7** | CLI entrypoints + two-tier CI (fast offline / nightly live) |
 | **8** | Statistical reporting, deterministic tests, documentation |
@@ -733,6 +733,105 @@ would make incomparable things indistinguishable rows and let
 `resume_from_run_id` resume across planes. A `plane` column plus a per-plane
 metric envelope is the remaining piece of the split.
 
+### Real-model verification, and Phase 5 — external benchmark adapters
+
+**Done: the real NLI model has now actually been run, a latent model-swap bug
+was found and fixed, and HaluEval/FEVER/generic converters exist.**
+
+#### The real model had never been run
+
+Every number this repo had ever produced — including the detector plane's own
+— came from `conftest.py`'s random mock. Before building anything on top, the
+12-item smoke set was run through the real
+`cross-encoder/nli-deberta-v3-base`. It scores **12/12**. That is a
+*machinery* result, not a quality result: the items are deliberately
+clear-cut. What it genuinely verifies is that the real model produces sane
+probabilities through this code path, that the empty-premise guard fires
+(`det-s12` → `no_premise`, never scored), and that numeric- and year-swap
+claims come back as CONTRADICTION.
+
+#### The label-order landmine it exposed
+
+The 3-way output order is a property of the **checkpoint**, not of NLI. The
+code hardcoded deberta's `(contradiction, entailment, neutral)` in three
+places — `verify_claims_batch`'s label list and its `[0]/[1]/[2]` index picks,
+`build_entailment_matrix`'s returned labels, and `stability.py`'s `s[1]`. But
+`NLI_MODEL` is env-overridable, and **roberta-large-mnli — the most natural
+swap — emits `(contradiction, neutral, entailment)`**. Changing that one env
+var would have silently exchanged "entailment" and "neutral" for every claim
+in the system: hallucinations scored as grounded, nothing raising, every
+governance artifact downstream quietly wrong.
+
+The order is now resolved once from the checkpoint's own `id2label`
+(`xai_matrices.NLI_LABELS` + index constants + `entailment_score_of`). A
+config that isn't a real mapping (the test suite's mock) falls back silently;
+one that IS a mapping but doesn't describe a three-way NLI head logs an error
+stating that verdicts from that model are not trustworthy. Verified against
+the real checkpoint's config and three unambiguous probes; the smoke set
+returns identical results before and after.
+
+#### Adapters
+
+New `eval/adapters.py` converts external benchmarks into detector items. It
+deliberately **does not download anything** — which benchmarks to use is a
+licensing and prioritization decision, and a converter that silently fetches
+several gigabytes on first call is not something to discover at runtime. Every
+converter returns `(items, report)`, and the report says what was dropped and
+why: a number computed over an unknown subset of a benchmark is not comparable
+to anyone else's number on that benchmark.
+
+* **HaluEval** is self-contained — each row carries the knowledge plus both a
+  correct and a hallucinated answer — so each row yields **two** items against
+  the *same* premise. That pairing controls for premise difficulty, so a score
+  difference is attributable to the claim rather than to the evidence, and the
+  resulting set is balanced by construction. `qa`, `dialogue` and
+  `summarization` field layouts are supported.
+* **FEVER** ships claims plus *pointers* to evidence (wiki page + sentence
+  index); the text lives in a separate dump. The converter takes a
+  `resolve_evidence(page, sentence_id)` callable, which keeps the large,
+  licence-encumbered corpus out of this repo and makes the converter testable.
+* **Generic** field-mapping for anything else, with labels still passing
+  through `detector.normalize_label` so an unrecognized spelling is reported
+  rather than coerced into a class.
+
+#### The FEVER NEI trap — why this is a module and not a ten-line loop
+
+FEVER's NOT ENOUGH INFO claims have **no gold evidence by construction**: the
+annotation says the corpus neither supports nor refutes them, so the evidence
+field is empty. Convert those naively and every one arrives with an empty
+premise — where the empty-premise guard flags it automatically and it scores
+as a correct catch. The result is **100% recall on the NEI class with the
+detector never having run**, and it looks exactly like a result.
+
+Such rows are therefore skipped by default and counted in the report
+(`skipped_nei_without_evidence`). A test demonstrates the failure concretely:
+keeping them yields `recall == 1.0` with every item at
+`evidence_status == "no_premise"`. Scoring FEVER's NEI class honestly requires
+supplying *candidate* evidence — what a retriever actually returned — which is
+a retrieval-plane concern the converter cannot invent. `keep_unresolvable_nei=True`
+exists for anyone who wants them anyway; the items are marked
+`premise_source="none"`.
+
+A SUPPORTS/REFUTES row whose evidence cannot be resolved is also dropped: the
+label asserts a relationship to text we do not have.
+
+#### Operator tool
+
+`backend/scripts/convert_benchmark.py` (manual, never pytest-collected) is the
+file plumbing — accepts JSONL or a JSON array, indexes a FEVER wiki dump, and
+writes a validated detector dataset. It warns when only one label class
+survives, since precision/recall then degenerate and AUROC is undefined.
+Verified end to end on synthetic HaluEval-shaped rows: convert → 6 balanced
+items → real model → clean metrics.
+
+**Tests:** `tests/test_adapters.py` (19) plus 5 label-order cases in
+`tests/test_nli_policy.py`. 364 tests pass (was 340).
+
+**What is still missing is only the data.** Point the converter at a real
+downloaded benchmark and the detector plane produces a real, externally
+comparable number with no API key and no retrieval. Nothing further needs to
+be built for that to happen.
+
 ### Pre-dating this effort, but foundational to it
 
 **Gemini → Groq/OpenRouter migration.** `shared/llm.py`: config-driven
@@ -755,9 +854,12 @@ per-key rate-limit state, key-blind retry).
   **detector and retrieval planes are both done** - see above. Multi-premise
   is no longer blocked on machinery, since the detector plane can score both
   arms; it is blocked only on a labeled dataset to score them with.
-- **Phase 5**: RAGTruth/HaluEval/FEVER/BEIR adapters — blocked on Phase 4's
-  plane split and the W4.3 normalization fix (done), pending the user's
-  prioritization/licensing decision.
+- **Phase 5 (mostly done)**: HaluEval, FEVER and generic adapters exist
+  (`eval/adapters.py` + `scripts/convert_benchmark.py`) — see above. What
+  remains is **running them on real downloaded data**, which is a licensing
+  and prioritization decision, not engineering. RAGTruth (span-level
+  annotations) and BEIR (retrieval; needs a corpus and the retrieval plane)
+  have no converter yet.
 - **Phase 6**: pipeline profile registry (`plain_rag` baseline, ablation
   switches) + paired comparison harness.
 - **Phase 7 (remainder)**: `eval/cli.py`, async job API, the nightly live-run
