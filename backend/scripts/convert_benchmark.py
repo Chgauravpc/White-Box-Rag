@@ -41,7 +41,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from eval.adapters import (  # noqa: E402
-    from_fever, from_generic, from_halueval, write_detector_dataset,
+    dataset_validity_report, from_fever, from_generic, from_halueval,
+    write_detector_dataset,
 )
 from eval.fever_wiki import WikiSentenceIndex  # noqa: E402
 
@@ -137,9 +138,16 @@ def main():
     for it in items:
         counts[it["label"]] = counts.get(it["label"], 0) + 1
     print("Label mix:", counts)
-    if len(counts) < 2:
-        print("  ! only one label class present — precision/recall degenerate "
-              "and AUROC is undefined.", file=sys.stderr)
+
+    # A shortcut in the converted data makes any score meaningless, so this is
+    # reported at conversion time rather than left to surface as a strange
+    # confusion matrix later.
+    validity = dataset_validity_report(items)
+    print("Claim length by label:", json.dumps(validity["claim_length_by_label"]))
+    for w in validity["warnings"]:
+        print(f"  ! VALIDITY: {w}", file=sys.stderr)
+    if not validity["warnings"]:
+        print("  validity checks passed")
 
 
 if __name__ == "__main__":

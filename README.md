@@ -221,7 +221,7 @@ cd backend
 pytest
 ```
 
-376 tests, entirely against mocked ML models (`backend/conftest.py`) and a fake `AsyncOpenAI` client (`backend/tests/test_llm_pool.py`) — no API key or model download needed. Runs automatically on every push/PR via `.github/workflows/tests.yml`.
+381 tests, entirely against mocked ML models (`backend/conftest.py`) and a fake `AsyncOpenAI` client (`backend/tests/test_llm_pool.py`) — no API key or model download needed. Runs automatically on every push/PR via `.github/workflows/tests.yml`.
 
 ---
 

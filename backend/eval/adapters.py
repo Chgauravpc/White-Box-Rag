@@ -242,3 +242,72 @@ def write_detector_dataset(items: list[dict], path: str) -> str:
         for it in items:
             f.write(json.dumps(it, ensure_ascii=False) + "\n")
     return path
+
+
+# ── Validity ────────────────────────────────────────────────
+
+def dataset_validity_report(items: list[dict]) -> dict:
+    """Check a converted dataset for shortcuts that would invalidate a score.
+
+    Written after a real incident. HaluEval QA's `right_answer` is an *answer*
+    ("Sidney Lumet") while its `hallucinated_answer` is a *sentence* ("First
+    for Women was started first."). Converted naively, the supported class had
+    a median claim length of 2 words and the refuted class 10 — separable by
+    length alone, with no reference to the evidence at all. Worse for an
+    NLI-based detector specifically: a bare noun phrase is not a proposition,
+    so nothing can entail it, and correct answers were returned NEUTRAL and
+    flagged as hallucinations. The resulting F1 described the benchmark's
+    shape, not the detector.
+
+    A number computed on a dataset with a shortcut this strong is not a
+    measurement, so this is reported loudly rather than left to be discovered
+    in the confusion matrix.
+    """
+    import statistics
+
+    from eval.detector import normalize_label
+
+    by_label: dict[str, list[int]] = {}
+    for it in items:
+        label = normalize_label(it.get("label"))
+        if label:
+            by_label.setdefault(label, []).append(len(str(it.get("claim", "")).split()))
+
+    lengths = {
+        label: {
+            "n": len(v),
+            "median_words": statistics.median(v) if v else 0,
+            "mean_words": round(statistics.mean(v), 1) if v else 0,
+            "pct_under_4_words": round(100 * sum(1 for x in v if x < 4) / len(v), 1) if v else 0,
+        }
+        for label, v in sorted(by_label.items())
+    }
+
+    warnings = []
+    medians = {label: st["median_words"] for label, st in lengths.items() if st["n"]}
+    if len(medians) >= 2:
+        lo, hi = min(medians.values()), max(medians.values())
+        # 3x is well past anything topic variation explains; at that point the
+        # label is predictable from claim length without reading the premise.
+        if lo > 0 and hi / lo >= 3:
+            warnings.append(
+                f"claim length differs {hi/lo:.1f}x across labels (medians {medians}) — "
+                f"the label is largely predictable from length alone, so any score on this "
+                f"dataset may measure the shortcut rather than the detector"
+            )
+        elif lo == 0 and hi > 0:
+            warnings.append(f"one label class has zero-length claims (medians {medians})")
+
+    for label, st in lengths.items():
+        if st["n"] and st["pct_under_4_words"] >= 50:
+            warnings.append(
+                f"{st['pct_under_4_words']:.0f}% of '{label}' claims are under 4 words — these are "
+                f"likely entity fragments, not propositions. An NLI detector cannot entail a "
+                f"fragment, so they will be scored NEUTRAL regardless of the evidence"
+            )
+
+    if len(lengths) < 2:
+        warnings.append("fewer than two label classes present — precision/recall degenerate "
+                        "and AUROC is undefined")
+
+    return {"n_items": len(items), "claim_length_by_label": lengths, "warnings": warnings}

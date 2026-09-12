@@ -14,7 +14,8 @@ import json
 import pytest
 
 from eval.adapters import (
-    from_fever, from_generic, from_halueval, write_detector_dataset,
+    dataset_validity_report, from_fever, from_generic, from_halueval,
+    write_detector_dataset,
 )
 from eval.detector import run_detector_eval, validate_detector_item
 
@@ -187,3 +188,53 @@ class TestWriteDataset:
         with pytest.raises(ValueError):
             write_detector_dataset([{"id": "x", "claim": "", "premise": "p", "label": "SUPPORTS"}],
                                    str(tmp_path / "bad.jsonl"))
+
+
+class TestValidityReport:
+    """Guards against shortcuts that make a score describe the dataset's shape
+    rather than the detector. Written after HaluEval QA's supported class came
+    out at a median of 2 words against the refuted class's 10 — separable by
+    length alone, with no reference to the evidence."""
+
+    def _items(self, supported_claims, refuted_claims):
+        out = []
+        for i, c in enumerate(supported_claims):
+            out.append({"id": f"s{i}", "claim": c, "premise": "some evidence", "label": "SUPPORTED"})
+        for i, c in enumerate(refuted_claims):
+            out.append({"id": f"r{i}", "claim": c, "premise": "some evidence", "label": "REFUTED"})
+        return out
+
+    def test_balanced_sentence_lengths_pass(self):
+        items = self._items(
+            ["The revenue rose by four percent last year."] * 5,
+            ["The revenue fell by nine percent last year."] * 5,
+        )
+        assert dataset_validity_report(items)["warnings"] == []
+
+    def test_length_shortcut_is_flagged(self):
+        """The real HaluEval QA failure: 2-word answers vs 10-word sentences."""
+        items = self._items(
+            ["Sidney Lumet"] * 5,
+            ["The film was directed by somebody else entirely, not him."] * 5,
+        )
+        warnings = dataset_validity_report(items)["warnings"]
+        assert any("predictable from length alone" in w for w in warnings)
+
+    def test_entity_fragments_are_flagged_specifically(self):
+        """An NLI detector cannot entail a fragment; that deserves its own
+        warning, not just the length one."""
+        items = self._items(["Sidney Lumet"] * 5, ["Lake Placid"] * 5)
+        warnings = dataset_validity_report(items)["warnings"]
+        assert any("not propositions" in w for w in warnings)
+
+    def test_single_class_is_flagged(self):
+        items = self._items(["A full sentence about something."] * 4, [])
+        assert any("fewer than two label classes" in w
+                   for w in dataset_validity_report(items)["warnings"])
+
+    def test_reports_per_label_statistics(self):
+        items = self._items(["one two"] * 3, ["one two three four five six"] * 3)
+        stats = dataset_validity_report(items)["claim_length_by_label"]
+        assert stats["SUPPORTED"]["median_words"] == 2
+        assert stats["REFUTED"]["median_words"] == 6
+        assert stats["SUPPORTED"]["n"] == 3

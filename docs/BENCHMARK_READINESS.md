@@ -853,6 +853,79 @@ downloaded benchmark and the detector plane produces a real, externally
 comparable number with no API key and no retrieval. Nothing further needs to
 be built for that to happen.
 
+### The first real external measurement — and why its number is not usable
+
+**HaluEval QA was downloaded, converted and scored against the real NLI model.
+The result is a benchmark-validity finding, not a detector score.**
+
+10,000 HaluEval QA rows converted cleanly into 20,000 detector items (perfectly
+balanced, nothing skipped). A seeded 500-row / 1,000-item sample scored against
+`cross-encoder/nli-deberta-v3-base`:
+
+| metric | value |
+|---|---|
+| precision | 0.483 [0.449, 0.518] |
+| recall | 0.758 [0.719, 0.793] |
+| F1 | 0.590 |
+| specificity | **0.190** |
+| balanced accuracy | **0.474** |
+| MCC | **−0.063** |
+| AUROC | 0.526 |
+
+Confusion: TP 379, FN 121, TN 95, **FP 405**. The system flagged **405 of 500
+correct answers** as hallucinated. Balanced accuracy below 0.5 and a negative
+MCC mean the output is very slightly *anti*-correlated with the truth — on this
+data the detector is worse than a coin flip.
+
+**That number describes the dataset, not the detector.** HaluEval QA's
+`right_answer` is an *answer* — a bare entity, "Sidney Lumet", "Indian
+Airlines" — while its `hallucinated_answer` is a *sentence*, "First for Women
+was started first." Measured over the full 20,000 items:
+
+| label | median claim length | under 4 words |
+|---|---|---|
+| SUPPORTED | 2 words | 88.6% |
+| REFUTED | 9 words | 3.8% |
+
+The classes are separable by length alone, without reading the evidence at
+all. And for an NLI detector specifically the mismatch is fatal: a bare noun
+phrase is not a proposition, so nothing can entail it. The model returns
+NEUTRAL, and the strip rule flags it. The entailment rate on *correct* answers
+rises monotonically with claim length — 17% at 1–3 words, 28% at 4–8, **80% at
+9+**. Given an actual claim, the detector behaves.
+
+So the honest reading is: **this run validates the measurement pipeline end to
+end and invalidates this particular conversion.** It is also precisely the
+failure that would have been published as "F1 0.59 on HaluEval" by anyone who
+reported the headline and skipped the confusion matrix.
+
+**A guard now exists so this cannot pass silently again.**
+`adapters.dataset_validity_report()` compares claim-length distributions across
+label classes and warns when the label is largely predictable from length
+(≥3× median divergence) or when a class is mostly sub-four-word fragments. It
+runs automatically at the end of every `scripts/convert_benchmark.py`
+conversion, and on this dataset it fires both warnings. A shortcut this strong
+means any score is a description of the benchmark's shape, so it is reported
+at conversion time rather than left to surface as a strange confusion matrix
+later.
+
+**What would make HaluEval QA usable:** turn the question and answer into a
+declarative claim ("Which magazine was started first...?" + "Arthur's
+Magazine" → "Arthur's Magazine was started first"), so both classes are
+propositions of comparable length. That needs question-to-statement
+conversion, which is an LLM or template job and a change in what is being
+measured — worth doing deliberately, not silently. HaluEval's `dialogue` and
+`summarization` splits do not have this problem (their responses are already
+sentences), and RAGTruth annotates spans inside generated text, so both are
+better next targets than a rewrite of the QA split.
+
+**Cost, measured:** 1,000 items took 552s (1.81 items/sec) on 6 CPU threads,
+so the full 20,000 is roughly 3 hours on this hardware. The detector plane
+makes no LLM calls, so the only cost is CPU time.
+
+**Tests:** 5 validity cases in `tests/test_adapters.py`. 381 tests pass
+(was 376).
+
 ### Pre-dating this effort, but foundational to it
 
 **Gemini → Groq/OpenRouter migration.** `shared/llm.py`: config-driven
