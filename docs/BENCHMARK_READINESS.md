@@ -591,6 +591,76 @@ this change are not comparable to runs after it.
 **Tests:** `tests/test_nli_policy.py` (19) and
 `tests/test_verification_routes.py` (3). 302 tests pass (was 280).
 
+### Phase 4 (continued) — the detector plane
+
+**Done: claim-verification quality is now measurable. This is the first time
+anything in this repo compares an NLI verdict to a label.**
+
+Before this, `eval/scoring.py::detector_metrics` — AUROC, AUPRC, per-error-type
+recall, all correctly implemented — was called from **nowhere**, and
+`eval/schema.py`'s `reference_claims` was validated and read by nothing. So the
+hallucination detector at the centre of the system had never been scored
+against ground truth. Every number the repo could produce described retrieval,
+generation or governance; none described *detection*.
+
+**What the plane is.** New `eval/detector.py`. Given rows of
+`(claim, premise, label)` it runs claim verification and nothing else — no
+retrieval, no generation, no LLM call, no database. That matters for two
+reasons: it costs nothing per item (so it can run over a full external
+benchmark rather than a handful of queries), and it isolates the detector from
+retrieval, so a retrieval change can no longer masquerade as a detection
+improvement. It is also the exact shape FEVER, HaluEval and RAGTruth already
+ship in, which is what makes the Phase 5 adapters small.
+
+**Three deliberate choices, each of which could have quietly invalidated the
+number:**
+
+* **The premise is not normalized** (`profile="none"` by default). The
+  normalizer profiles exist to strip PDF artifacts from *this* corpus; running
+  them over a benchmark's own evidence text would produce a number nobody
+  outside this repo could reproduce. `shared/text_normalize.py` documents the
+  `none` profile as existing for precisely this.
+* **The prediction is the shipped decision rule.** `y_pred_flagged` comes from
+  `verification/mitigation.py::_should_strip` — the same function the live
+  pipeline uses to decide whether a claim survives into the mitigated answer.
+  Reimplementing "flagged" inside the harness would measure a detector this
+  repo does not ship; a test asserts the real function is the one called.
+* **The positive class is `label != SUPPORTED`**, grouping REFUTED (evidence
+  contradicts) with NEI (evidence is silent), because the system's job is to
+  assert neither. They are *also* reported separately: the label is passed
+  through as `error_types`, so `recall_by_error_type` says "catches X% of
+  contradictions, Y% of unsupported" instead of hiding the difference in one
+  aggregate. `verdict_confusion` (gold label × raw NLI verdict) additionally
+  separates "the NLI model is wrong" from "the strip threshold is
+  miscalibrated" — a single precision/recall pair cannot distinguish those,
+  and they have completely different fixes.
+
+**Benchmark label aliases** are mapped up front (`SUPPORTS`/`REFUTES`/`NOT
+ENOUGH INFO` and the common binary spellings), and an *unrecognized* label is
+rejected rather than coerced — silently bucketing an unknown label would
+corrupt the ground truth itself.
+
+**`POST /api/eval/detector`** runs it. Deliberately **not** persisted to
+`eval_runs`: that table's columns and metric shape describe an end-to-end run,
+and writing a detector run into it would make two incomparable things
+indistinguishable rows (and let `resume_from_run_id` resume across planes).
+Persistence lands with the rest of the plane split, along with a plane column.
+
+**`eval/detector_smoke.jsonl`** (12 items, balanced 4 SUPPORTED / 4 REFUTED /
+4 NEI) ships so the endpoint is runnable immediately. It is a *machinery*
+check, not a benchmark — it deliberately includes the error classes that
+separate detectors (numeric swap, year swap, negation, unsupported
+elaboration) plus one empty-premise item that exercises the guard end to end.
+Tests assert it stays loadable, balanced and unique-id'd so it cannot rot.
+
+**Not yet measured, and worth being explicit about:** running the plane under
+the test suite exercises the *mocked* NLI model, so the metrics it produces
+there are noise (AUROC ≈ 0.5, as expected). A real number requires the real
+`cross-encoder/nli-deberta-v3-base` weights and a real labeled dataset. The
+plumbing is now in place for both; neither has been run here.
+
+**Tests:** `tests/test_detector.py` (24). 326 tests pass (was 302).
+
 ### Pre-dating this effort, but foundational to it
 
 **Gemini → Groq/OpenRouter migration.** `shared/llm.py`: config-driven
@@ -608,13 +678,14 @@ per-key rate-limit state, key-blind retry).
   graded `relevant_chunk_keys`, and an actually-frozen benchmark corpus.
   Corpus identity (W3.1) is done; see above for the open decisions blocking
   the labeling itself.
-- **Phase 4 (remainder)**: split the harness into retrieval/detector/
-  end-to-end planes; multi-premise NLI (the empty-premise half of finding #10
-  is done - see above; the multi-premise half is deliberately blocked on
-  having detector ground truth to justify an aggregation rule). The detector
-  plane is the priority: `scoring.detector_metrics` and
-  `schema.reference_claims` both exist and are read by nothing, so NLI verdict
-  quality is currently unmeasured.
+- **Phase 4 (remainder)**: the retrieval and end-to-end planes (the
+  **detector plane is done** - see above), plane-aware persistence in
+  `eval_runs`, and multi-premise NLI. Multi-premise is no longer blocked on
+  *machinery* - the detector plane can now score both arms - only on a labeled
+  dataset to score them with. The retrieval plane is the other clear win:
+  today retrieval cannot be scored without generating, since
+  `run_query_pipeline` calls `rag_query` unconditionally, so a retrieval-only
+  plane would make BEIR-scale sweeps affordable (zero LLM calls).
 - **Phase 5**: RAGTruth/HaluEval/FEVER/BEIR adapters — blocked on Phase 4's
   plane split and the W4.3 normalization fix (done), pending the user's
   prioritization/licensing decision.

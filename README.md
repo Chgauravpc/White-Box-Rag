@@ -124,7 +124,8 @@ White Box RAG/
 │   │   └── domain_profiles.py     # swappable persona/vocabulary (generic default; financial_reports)
 │   ├── governance/                # HITL review queue router (Governance)
 │   ├── eval/                      # offline evaluation harness + conformal calibration
-│   │   ├── harness.py             # run_eval / run_calibration
+│   │   ├── harness.py             # run_eval / run_calibration (end-to-end plane)
+│   │   ├── detector.py            # detector plane: claim+premise+label → P/R/F1/AUROC, no retrieval/LLM
 │   │   ├── scoring.py             # label-vs-prediction accuracy: P/R/F1/nDCG/AUROC + CIs
 │   │   └── schema.py              # dataset v2 shape + validator + v1 compatibility loader
 │   ├── scripts/                   # manual, live-credential operator tools (never pytest-collected)
@@ -203,7 +204,7 @@ All routes are mounted under `/api`:
 | **Verification** | Verify claims, score faithfulness, run the trust gate |
 | **Compliance** | Map requirements to the corpus, produce gap/violation analysis and audit reports; `GET /api/audit/verify-integrity` (chain check), `GET /api/compliance/frameworks` (regulatory mapping) |
 | **Governance** | HITL review of flagged audits: `GET /api/review/queue`, `POST /api/review/{id}/resolve`, `GET /api/review/{id}/history` |
-| **Eval** | Run the offline harness; `POST /api/eval/calibrate` (`force?`) + `GET /api/eval/calibration` (conformal abstention, reports `status`/`effective`) |
+| **Eval** | Run the offline harness; `POST /api/eval/detector` (detector plane: per-claim hallucination-detection accuracy, no retrieval/LLM); `POST /api/eval/calibrate` (`force?`) + `GET /api/eval/calibration` (conformal abstention, reports `status`/`effective`) |
 | **LLM pool** | `GET /api/llm/pool` — live per-endpoint health/headroom snapshot (never the raw key, only its fingerprint) |
 
 See the interactive OpenAPI docs at `/docs` for full request/response schemas.
@@ -217,7 +218,7 @@ cd backend
 pytest
 ```
 
-302 tests, entirely against mocked ML models (`backend/conftest.py`) and a fake `AsyncOpenAI` client (`backend/tests/test_llm_pool.py`) — no API key or model download needed. Runs automatically on every push/PR via `.github/workflows/tests.yml`.
+326 tests, entirely against mocked ML models (`backend/conftest.py`) and a fake `AsyncOpenAI` client (`backend/tests/test_llm_pool.py`) — no API key or model download needed. Runs automatically on every push/PR via `.github/workflows/tests.yml`.
 
 ---
 

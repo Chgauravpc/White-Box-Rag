@@ -5,6 +5,8 @@ Endpoints:
   POST /api/eval/run          — Run the golden dataset through the real pipeline
   GET  /api/eval/runs         — List past run summaries (for trend charting)
   GET  /api/eval/runs/{id}    — Full run detail with per-query breakdown
+  POST /api/eval/detector     — Detector plane: score claim verification against
+                                per-claim labels (no retrieval, no LLM)
 """
 
 import json
@@ -15,6 +17,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from eval.detector import run_detector_eval_from_file
 from eval.harness import run_eval, run_calibration, _load_dataset, capture_run_provenance
 from shared.database import insert_eval_run_started, finalize_eval_run, list_eval_runs, get_eval_run
 from verification.conformal import load_active_calibration, min_n_for_alpha
@@ -25,6 +28,7 @@ router = APIRouter(prefix="/eval", tags=["Evaluation"])
 
 DEFAULT_DATASET_PATH = os.path.join(os.path.dirname(__file__), "golden_dataset.jsonl")
 DEFAULT_CALIBRATION_DATASET = os.path.join(os.path.dirname(__file__), "calibration_dataset.jsonl")
+DEFAULT_DETECTOR_DATASET = os.path.join(os.path.dirname(__file__), "detector_smoke.jsonl")
 
 
 def _utcnow_iso() -> str:
@@ -36,6 +40,13 @@ class RunEvalRequest(BaseModel):
     run_label: str = ""
     eval_mode: bool = True
     resume_from_run_id: int | None = None
+
+
+class DetectorEvalRequest(BaseModel):
+    dataset_path: str | None = None
+    # "none" leaves a benchmark's own evidence text untouched; anything else
+    # makes the number un-reproducible outside this repo.
+    premise_normalizer: str = "none"
 
 
 class CalibrateRequest(BaseModel):
@@ -98,6 +109,30 @@ async def trigger_eval_run(request: RunEvalRequest):
 
     result["id"] = run_id
     return result
+
+
+@router.post("/detector")
+async def trigger_detector_eval(request: DetectorEvalRequest):
+    """Score the claim-verification stage against per-claim ground truth.
+
+    The detector plane runs no retrieval, no generation and no LLM call, so it
+    needs no API key and costs nothing per item — which is what makes it
+    usable over a full external benchmark (FEVER / HaluEval / RAGTruth all
+    ship (claim, evidence, label) rows directly).
+
+    Not persisted to `eval_runs`: that table's columns and metric shape
+    describe an end-to-end run, and writing a detector run into it would make
+    two incomparable things indistinguishable. Persistence lands with the rest
+    of the plane split.
+    """
+    dataset_path = request.dataset_path or DEFAULT_DETECTOR_DATASET
+    if not os.path.exists(dataset_path):
+        raise HTTPException(status_code=404, detail=f"Detector dataset not found: {dataset_path}")
+    try:
+        return run_detector_eval_from_file(dataset_path, profile=request.premise_normalizer)
+    except Exception as exc:
+        logger.exception("Detector eval failed")
+        raise HTTPException(status_code=500, detail=f"Detector eval failed: {exc}")
 
 
 @router.post("/calibrate")
